@@ -1,0 +1,3314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SDRS Manager</title>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"]
+          },
+          boxShadow: {
+            soft: "0 10px 30px rgba(2, 8, 23, 0.08)"
+          },
+          animation: {
+            shimmer: "shimmer 1.5s linear infinite"
+          },
+          keyframes: {
+            shimmer: {
+              "0%": { backgroundPosition: "-700px 0" },
+              "100%": { backgroundPosition: "700px 0" }
+            }
+          }
+        }
+      }
+    };
+  </script>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet"
+  />
+
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <style>
+    html, body {
+      height: 100%;
+    }
+
+    body {
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+
+    .skeleton {
+      background: linear-gradient(
+        90deg,
+        rgba(148, 163, 184, 0.12) 25%,
+        rgba(148, 163, 184, 0.24) 37%,
+        rgba(148, 163, 184, 0.12) 63%
+      );
+      background-size: 1400px 100%;
+      animation: shimmer 1.5s linear infinite;
+    }
+
+    .thin-scrollbar::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+
+    .thin-scrollbar::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.45);
+      border-radius: 999px;
+    }
+
+    .thin-scrollbar::-webkit-scrollbar-track {
+      background: transparent;
+    }
+  </style>
+</head>
+<body class="bg-slate-950">
+  <div id="app"></div>
+
+  <script>
+    const DEFAULT_API_BASE = `http://${window.location.hostname || "localhost"}:8010`;
+
+    const state = {
+      apiBase: DEFAULT_API_BASE,
+      theme: "light",
+      sidebarOpen: false,
+      route: { name: "dashboard", clusterId: null, datastoreId: null },
+
+      health: null,
+      backendReachable: false,
+      connected: false,
+      connectionLoading: false,
+      connectionError: "",
+
+      clusters: [],
+      clustersLoaded: false,
+      clusterDetails: {},
+      clusterRecs: {},
+      clusterCandidates: {},
+      clusterSimulation: {},
+      datastoreVms: {},
+      allRecommendations: [],
+      allCandidates: [],
+      selectedDatastore: {
+        clusterId: "",
+        datastoreId: "",
+        datastoreName: ""
+      },
+      moveForm: {
+        clusterId: "",
+        sourceDatastoreId: "",
+        vmId: "",
+        targetDatastoreId: ""
+      },
+      moveOptionsByVm: {},
+      movePreview: null,
+      moveConfirm: {
+        open: false,
+        clusterId: "",
+        vmId: "",
+        vmName: "",
+        sourceDatastoreId: "",
+        sourceDatastoreName: "",
+        targetDatastoreId: "",
+        targetDatastoreName: "",
+        sizeGb: null
+      },
+      moveTask: {
+        taskId: "",
+        state: "",
+        progress: null,
+        error: "",
+        active: false
+      },
+
+      loading: {
+        health: false,
+        clusters: false,
+        allRecommendations: false,
+        allCandidates: false,
+        clusterDetail: false,
+        clusterRecommendations: false,
+        clusterCandidates: false,
+        clusterSimulation: false,
+        datastoreVms: false,
+        moveOptions: false,
+        vmMove: false,
+        taskStatus: false,
+        clusterEnhancement: false,
+        vcenterConfig: false,
+        action: false
+      },
+
+      errors: {
+        health: "",
+        clusters: "",
+        recommendations: "",
+        candidates: "",
+        clusterDetail: "",
+        clusterRecommendations: "",
+        clusterCandidates: "",
+        clusterSimulation: "",
+        datastoreVms: "",
+        moveOptions: "",
+        vmMove: "",
+        taskStatus: "",
+        vcenterConfig: ""
+      },
+
+      vcenterForm: {
+        host: "",
+        user: "",
+        password: "",
+        verify_ssl: true
+      },
+
+      modal: {
+        open: false,
+        clusterId: "",
+        key: "",
+        title: "",
+        body: ""
+      },
+
+      toast: {
+        visible: false,
+        type: "info",
+        message: ""
+      }
+    };
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function formatNumber(value, digits = 0) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      return Number(value).toLocaleString(undefined, {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits
+      });
+    }
+
+    function formatGb(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      const num = Number(value);
+      if (num >= 1024) return `${formatNumber(num / 1024, 2)} TB`;
+      return `${formatNumber(num, 2)} GB`;
+    }
+
+    function formatPct(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      return `${formatNumber(value, 1)}%`;
+    }
+
+    function formatMs(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      return `${formatNumber(value, 2)} ms`;
+    }
+
+    function statusBadge(label, tone = "slate") {
+      const map = {
+        teal: "bg-teal-50 text-teal-700 border-teal-200",
+        emerald: "bg-emerald-50 text-emerald-700 border-emerald-200",
+        amber: "bg-amber-50 text-amber-700 border-amber-200",
+        rose: "bg-rose-50 text-rose-700 border-rose-200",
+        sky: "bg-sky-50 text-sky-700 border-sky-200",
+        violet: "bg-violet-50 text-violet-700 border-violet-200",
+        slate: "bg-slate-100 text-slate-700 border-slate-200"
+      };
+      const cls = map[tone] || map.slate;
+      return `<span class="inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-semibold ${cls}">${escapeHtml(label)}</span>`;
+    }
+
+    function getConnectionBadge() {
+      if (state.connectionLoading) return statusBadge("Connecting", "sky");
+      if (state.connected) return statusBadge("Connected", "emerald");
+      if (state.backendReachable) return statusBadge("Disconnected", "amber");
+      return statusBadge("Backend Offline", "rose");
+    }
+
+    function isReadOnlyMode() {
+      return state.health?.read_only !== false;
+    }
+
+    function getSafetyPolicy() {
+      return state.health?.safety_policy || {};
+    }
+
+    function canManageRecommendations() {
+      const policy = getSafetyPolicy();
+      return policy.forbid_recommendation_apply_dismiss === false;
+    }
+
+    function renderReadOnlyBanner() {
+      const readOnly = isReadOnlyMode();
+      const policy = getSafetyPolicy();
+      const blockedOps = Array.isArray(policy.blocked_vm_operations) ? policy.blocked_vm_operations : [];
+      const adminKeyRequired = policy.write_admin_key_required === true;
+      const blockedSummary = blockedOps.length
+        ? blockedOps.slice(0, 4).join(", ")
+        : "Destroy_Task, UnregisterVM, PowerOffVM_Task, ReconfigVM_Task";
+
+      return `
+        <div class="mb-6 rounded-2xl border ${readOnly ? "border-amber-200 bg-amber-50 text-amber-800" : "border-sky-200 bg-sky-50 text-sky-800"} px-4 py-3 text-sm">
+          <div class="font-semibold">
+            Política de segurança fixa: esta aplicação não exclui VM em hipótese nenhuma.
+          </div>
+          <div class="mt-1">
+            Escopo: somente movimentação de VM entre datastores por Storage vMotion controlado.
+            ${readOnly ? "Modo read-only ativo nesta fase de testes." : "Modo de escrita controlada ativo."}
+          </div>
+          <div class="mt-1 text-xs opacity-90">
+            Operações de VM bloqueadas: ${escapeHtml(blockedSummary)}
+          </div>
+          ${adminKeyRequired ? '<div class="mt-1 text-xs opacity-90">Escrita exige X-Admin-Key configurada no backend.</div>' : ""}
+        </div>
+      `;
+    }
+
+    function getThemeClasses() {
+      if (state.theme === "dark") {
+        return {
+          shell: "bg-slate-950 text-slate-100",
+          panel: "bg-slate-900 border-slate-800 text-slate-100",
+          subtle: "text-slate-400",
+          strong: "text-slate-100",
+          softBg: "bg-slate-950/60",
+          hover: "hover:bg-slate-800/70",
+          input: "bg-slate-950 border-slate-700 text-slate-100 placeholder:text-slate-500",
+          rowBorder: "border-slate-800",
+          tableHead: "bg-slate-950/50 text-slate-400",
+          divider: "border-slate-800",
+          empty: "bg-slate-900 border-slate-800 text-slate-400"
+        };
+      }
+
+      return {
+        shell: "bg-slate-100 text-slate-900",
+        panel: "bg-white border-slate-200 text-slate-900",
+        subtle: "text-slate-500",
+        strong: "text-slate-900",
+        softBg: "bg-slate-50",
+        hover: "hover:bg-slate-50",
+        input: "bg-white border-slate-300 text-slate-900 placeholder:text-slate-400",
+        rowBorder: "border-slate-200",
+        tableHead: "bg-slate-50 text-slate-500",
+        divider: "border-slate-200",
+        empty: "bg-white border-slate-200 text-slate-500"
+      };
+    }
+
+    function parseRoute() {
+      const hash = (window.location.hash || "#dashboard").replace(/^#/, "");
+      if (!hash || hash === "/") return { name: "dashboard", clusterId: null, datastoreId: null };
+      if (hash === "dashboard") return { name: "dashboard", clusterId: null, datastoreId: null };
+      if (hash === "clusters") return { name: "clusters", clusterId: null, datastoreId: null };
+      if (hash === "recommendations") return { name: "recommendations", clusterId: null, datastoreId: null };
+      if (hash === "vcenter") return { name: "vcenter", clusterId: null, datastoreId: null };
+      if (hash === "settings") return { name: "settings", clusterId: null, datastoreId: null };
+
+      const parts = hash.split("/");
+      if (parts[0] === "cluster" && parts[1] && parts[2] === "datastore" && parts[3]) {
+        return {
+          name: "datastore",
+          clusterId: decodeURIComponent(parts[1]),
+          datastoreId: decodeURIComponent(parts[3])
+        };
+      }
+      if (parts[0] === "cluster" && parts[1]) {
+        return { name: "cluster", clusterId: decodeURIComponent(parts[1]), datastoreId: null };
+      }
+
+      return { name: "dashboard", clusterId: null, datastoreId: null };
+    }
+
+    function setHash(hash) {
+      window.location.hash = hash;
+    }
+
+    function datastoreKey(clusterId, datastoreId) {
+      return `${clusterId}::${datastoreId}`;
+    }
+
+    function moveVmKey(clusterId, sourceDatastoreId, vmId) {
+      return `${clusterId}::${sourceDatastoreId}::${vmId}`;
+    }
+
+    let moveTaskPollTimer = null;
+
+    function getApiBaseCandidates() {
+      const primary = String(state.apiBase || "").replace(/\/+$/, "");
+      if (!primary) return [DEFAULT_API_BASE];
+      return [primary];
+    }
+
+    function buildHttpErrorMessage(response, payload, path) {
+      const status = Number(response?.status || 0);
+      const detail = payload?.detail || payload?.message || "";
+
+      if (status === 401) {
+        return detail || "401 não autorizado. Verifique credenciais/chave de acesso.";
+      }
+      if (status === 403) {
+        return detail || "403 bloqueado por política de segurança (read-only ou regra de escrita).";
+      }
+      if (status === 404) {
+        return detail || `404 endpoint não encontrado (${path}). Reinicie o backend atualizado.`;
+      }
+      if (status === 502) {
+        return detail || "502 erro de comunicação entre backend e vCenter.";
+      }
+      if (status === 504) {
+        return detail || "504 timeout ao consultar vCenter.";
+      }
+      if (detail) {
+        return `${detail} (HTTP ${status || "?"})`;
+      }
+      return `Falha no backend (HTTP ${status || "?"}) ao acessar ${path}.`;
+    }
+
+    function buildNetworkErrorMessage(path, bases, error) {
+      const name = String(error?.name || "");
+      const text = String(error?.message || "");
+      const targets = bases.join(", ");
+      if (name === "TypeError") {
+        return `Não foi possível alcançar o backend (${targets}). Verifique backend ativo e política de CORS.`;
+      }
+      if (text) {
+        return `Falha de rede ao acessar ${path}: ${text}`;
+      }
+      return `Falha de rede ao acessar ${path}. Backend alvo: ${targets}`;
+    }
+
+    async function apiFetch(path, options = {}) {
+      const config = {
+        method: options.method || "GET",
+        headers: {
+          "Accept": "application/json",
+          ...(options.body ? { "Content-Type": "application/json" } : {}),
+          ...(options.headers || {})
+        },
+        ...(options.body ? { body: JSON.stringify(options.body) } : {})
+      };
+
+      const baseCandidates = getApiBaseCandidates();
+      let response = null;
+      let payload = null;
+      let lastError = null;
+
+      for (const base of baseCandidates) {
+        const url = `${base}${path}`;
+        try {
+          response = await fetch(url, config);
+          if (state.apiBase !== base) {
+            state.apiBase = base;
+          }
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+
+      if (!response) {
+        throw new Error(buildNetworkErrorMessage(path, baseCandidates, lastError));
+      }
+
+      try {
+        payload = await response.json();
+      } catch (_) {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        throw new Error(buildHttpErrorMessage(response, payload, path));
+      }
+
+      return payload;
+    }
+
+    function showToast(message, type = "info") {
+      state.toast = { visible: true, message, type };
+      render();
+      window.clearTimeout(showToast._timer);
+      showToast._timer = window.setTimeout(() => {
+        state.toast.visible = false;
+        render();
+      }, 2800);
+    }
+
+    async function loadHealth(force = false) {
+      if (state.loading.health && !force) return;
+      state.loading.health = true;
+      state.errors.health = "";
+      render();
+
+      try {
+        const data = await apiFetch("/api/health");
+        state.health = data;
+        state.backendReachable = true;
+      } catch (error) {
+        state.health = null;
+        state.backendReachable = false;
+        state.connected = false;
+        state.errors.health = error.message;
+      } finally {
+        state.loading.health = false;
+        render();
+      }
+    }
+
+    async function connectVcenter(showSuccessToast = false) {
+      state.connectionLoading = true;
+      state.connectionError = "";
+      render();
+
+      try {
+        const data = await apiFetch("/api/auth/connect", { method: "POST" });
+        state.connected = !!data?.connected;
+        state.backendReachable = true;
+        if (showSuccessToast) showToast("Conexão com o vCenter validada.", "success");
+      } catch (error) {
+        state.connected = false;
+        state.connectionError = error.message;
+        showToast(error.message, "error");
+      } finally {
+        state.connectionLoading = false;
+        render();
+      }
+    }
+
+    async function loadVcenterConfig(force = false) {
+      if (state.loading.vcenterConfig && !force) return;
+
+      state.loading.vcenterConfig = true;
+      state.errors.vcenterConfig = "";
+      render();
+
+      try {
+        const data = await apiFetch("/api/vcenter/config");
+        if (data?.configured) {
+          state.vcenterForm.host = data.host || "";
+          state.vcenterForm.user = data.user || "";
+          state.vcenterForm.password = "";
+          state.vcenterForm.verify_ssl = data.verify_ssl !== false;
+        }
+      } catch (error) {
+        state.errors.vcenterConfig = String(error.message).includes("404")
+          ? "Backend sem suporte à aba vCenter. Reinicie o backend com a versão atual."
+          : error.message;
+      } finally {
+        state.loading.vcenterConfig = false;
+        render();
+      }
+    }
+
+    async function saveVcenterConfig(showSuccessToast = true) {
+      const host = String(state.vcenterForm.host || "").trim();
+      const user = String(state.vcenterForm.user || "").trim();
+      const password = String(state.vcenterForm.password || "");
+      const verify_ssl = !!state.vcenterForm.verify_ssl;
+
+      if (!host || !user || !password) {
+        showToast("Preencha host, usuário e senha do vCenter.", "error");
+        return;
+      }
+
+      state.loading.vcenterConfig = true;
+      state.errors.vcenterConfig = "";
+      render();
+
+      try {
+        await apiFetch("/api/vcenter/config", {
+          method: "POST",
+          body: {
+            host,
+            user,
+            password,
+            verify_ssl
+          }
+        });
+
+        state.vcenterForm.password = "";
+        await Promise.all([loadHealth(true), connectVcenter(false)]);
+        if (showSuccessToast) showToast("Configuração de vCenter salva em runtime.", "success");
+      } catch (error) {
+        const friendly = String(error.message).includes("404")
+          ? "Backend desatualizado: reinicie para habilitar /api/vcenter/config."
+          : error.message;
+        state.errors.vcenterConfig = friendly;
+        showToast(friendly, "error");
+      } finally {
+        state.loading.vcenterConfig = false;
+        render();
+      }
+    }
+
+    async function loadClusters(force = false) {
+      if (state.loading.clusters && !force) return;
+      if (state.clustersLoaded && !force) return;
+
+      state.loading.clusters = true;
+      state.errors.clusters = "";
+      render();
+
+      try {
+        const data = await apiFetch("/api/clusters");
+        state.clusters = Array.isArray(data) ? data : [];
+        state.clustersLoaded = true;
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.clusters = error.message;
+        state.connected = false;
+      } finally {
+        state.loading.clusters = false;
+        render();
+      }
+    }
+
+    async function loadClusterDetail(clusterId, force = false) {
+      if (!clusterId) return;
+      if (state.loading.clusterDetail && !force) return;
+      if (state.clusterDetails[clusterId] && !force) return;
+
+      state.loading.clusterDetail = true;
+      state.errors.clusterDetail = "";
+      render();
+
+      try {
+        const detail = await apiFetch(`/api/clusters/${encodeURIComponent(clusterId)}`);
+        state.clusterDetails[clusterId] = detail;
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.clusterDetail = error.message;
+        if (!state.clusterDetails[clusterId]) state.clusterDetails[clusterId] = null;
+      } finally {
+        state.loading.clusterDetail = false;
+        render();
+      }
+    }
+
+    async function loadClusterRecommendations(clusterId, force = false) {
+      if (!clusterId) return;
+      if (state.loading.clusterRecommendations && !force) return;
+      if (state.clusterRecs[clusterId] && !force) return;
+
+      state.loading.clusterRecommendations = true;
+      state.errors.clusterRecommendations = "";
+      render();
+
+      try {
+        const recs = await apiFetch(`/api/clusters/${encodeURIComponent(clusterId)}/recs`);
+        state.clusterRecs[clusterId] = Array.isArray(recs) ? recs : [];
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.clusterRecommendations = error.message;
+        if (!state.clusterRecs[clusterId]) state.clusterRecs[clusterId] = [];
+      } finally {
+        state.loading.clusterRecommendations = false;
+        render();
+      }
+    }
+
+    async function loadClusterCandidates(clusterId, force = false) {
+      if (!clusterId) return;
+      if (state.loading.clusterCandidates && !force) return;
+      if (state.clusterCandidates[clusterId] && !force) return;
+
+      state.loading.clusterCandidates = true;
+      state.errors.clusterCandidates = "";
+      render();
+
+      try {
+        const payload = await apiFetch(`/api/clusters/${encodeURIComponent(clusterId)}/candidates?limit=25`);
+        const items = Array.isArray(payload?.items) ? payload.items : [];
+        state.clusterCandidates[clusterId] = {
+          ...(payload || {}),
+          items
+        };
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.clusterCandidates = error.message;
+        if (!state.clusterCandidates[clusterId]) {
+          state.clusterCandidates[clusterId] = { items: [], reason: "error" };
+        }
+      } finally {
+        state.loading.clusterCandidates = false;
+        render();
+      }
+    }
+
+    async function loadClusterSimulation(clusterId, force = false, maxMoves = 3) {
+      if (!clusterId) return;
+      if (state.loading.clusterSimulation && !force) return;
+      if (state.clusterSimulation[clusterId] && !force) return;
+
+      state.loading.clusterSimulation = true;
+      state.errors.clusterSimulation = "";
+      render();
+
+      try {
+        const payload = await apiFetch(
+          `/api/clusters/${encodeURIComponent(clusterId)}/candidates/simulate?max_moves=${encodeURIComponent(maxMoves)}`
+        );
+        state.clusterSimulation[clusterId] = payload || {};
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.clusterSimulation = error.message;
+        if (!state.clusterSimulation[clusterId]) {
+          state.clusterSimulation[clusterId] = { items: [], reason: "error" };
+        }
+      } finally {
+        state.loading.clusterSimulation = false;
+        render();
+      }
+    }
+
+    async function loadDatastoreVms(clusterId, datastoreId, force = false) {
+      if (!clusterId || !datastoreId) return;
+      const key = datastoreKey(clusterId, datastoreId);
+
+      if (state.loading.datastoreVms && !force) return;
+      if (state.datastoreVms[key] && !force) return;
+
+      state.loading.datastoreVms = true;
+      state.errors.datastoreVms = "";
+      render();
+
+      try {
+        const payload = await apiFetch(`/api/clusters/${encodeURIComponent(clusterId)}/datastores/${encodeURIComponent(datastoreId)}/vms`);
+        state.datastoreVms[key] = {
+          ...(payload || {}),
+          items: Array.isArray(payload?.items) ? payload.items : []
+        };
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.datastoreVms = error.message;
+        if (!state.datastoreVms[key]) {
+          state.datastoreVms[key] = { items: [], reason: "error" };
+        }
+      } finally {
+        state.loading.datastoreVms = false;
+        render();
+      }
+    }
+
+    async function loadMoveOptions(clusterId, sourceDatastoreId, vmId, force = false) {
+      if (!clusterId || !sourceDatastoreId || !vmId) return null;
+      const key = moveVmKey(clusterId, sourceDatastoreId, vmId);
+
+      if (state.loading.moveOptions && !force) return state.moveOptionsByVm[key] || null;
+      if (state.moveOptionsByVm[key] && !force) return state.moveOptionsByVm[key];
+
+      state.loading.moveOptions = true;
+      state.errors.moveOptions = "";
+      render();
+
+      try {
+        const path = `/api/clusters/${encodeURIComponent(clusterId)}/vms/${encodeURIComponent(vmId)}/move/options?source_datastore_id=${encodeURIComponent(sourceDatastoreId)}`;
+        const payload = await apiFetch(path);
+        state.moveOptionsByVm[key] = payload || {};
+        return state.moveOptionsByVm[key];
+      } catch (error) {
+        state.errors.moveOptions = error.message;
+        showToast(error.message, "error");
+        return null;
+      } finally {
+        state.loading.moveOptions = false;
+        render();
+      }
+    }
+
+    function findDatastoreById(clusterId, datastoreId) {
+      const detail = state.clusterDetails[clusterId];
+      if (!detail || !Array.isArray(detail.datastores)) return null;
+      return detail.datastores.find((ds) => ds.id === datastoreId) || null;
+    }
+
+    function findVmByIdInSelectedDatastore(vmId) {
+      const ds = state.selectedDatastore;
+      if (!ds.clusterId || !ds.datastoreId) return null;
+      const key = datastoreKey(ds.clusterId, ds.datastoreId);
+      const items = state.datastoreVms[key]?.items;
+      if (!Array.isArray(items)) return null;
+      return items.find((vm) => vm.vm_id === vmId) || null;
+    }
+
+    function getMoveOptionsForForm(clusterId, sourceDatastoreId, vmId) {
+      if (!clusterId || !sourceDatastoreId || !vmId) return null;
+      const key = moveVmKey(clusterId, sourceDatastoreId, vmId);
+      return state.moveOptionsByVm[key] || null;
+    }
+
+    function getMoveTargetFromOptions(moveOptions, targetDatastoreId) {
+      if (!moveOptions || !targetDatastoreId) return null;
+      const targets = Array.isArray(moveOptions.targets) ? moveOptions.targets : [];
+      return targets.find((item) => item.datastore_id === targetDatastoreId) || null;
+    }
+
+    function humanizeMoveReason(reason) {
+      const map = {
+        insufficient_free_space_with_reserve: "Espaço livre insuficiente com margem de segurança",
+        projected_usage_too_high: "Uso projetado muito alto após a migração"
+      };
+      return map[String(reason || "")] || String(reason || "restrição não especificada");
+    }
+
+    function buildMovePreview(clusterId, sourceDatastoreId, targetDatastoreId, vmId) {
+      const vm = findVmByIdInSelectedDatastore(vmId);
+      const moveOptions = getMoveOptionsForForm(clusterId, sourceDatastoreId, vmId);
+      const optionTarget = getMoveTargetFromOptions(moveOptions, targetDatastoreId);
+
+      if (moveOptions && optionTarget) {
+        return {
+          vmName: moveOptions.vm_name || vm?.vm_name || "unknown",
+          vmId: moveOptions.vm_id || vmId,
+          vmSizeGb: Number(moveOptions.vm_size_gb ?? vm?.size_gb ?? 0),
+          source: {
+            datastoreId: moveOptions.source_datastore_id || sourceDatastoreId,
+            datastoreName: moveOptions.source_datastore_name || findDatastoreById(clusterId, sourceDatastoreId)?.name || "unknown",
+            currentFreeGb: Number(moveOptions.source_current_free_gb ?? 0),
+            currentUsedPct: Number(moveOptions.source_current_used_pct ?? 0),
+            projectedFreeGb: Number(moveOptions.source_projected_free_gb ?? 0),
+            projectedUsedPct: Number(moveOptions.source_projected_used_pct ?? 0)
+          },
+          target: {
+            datastoreId: optionTarget.datastore_id,
+            datastoreName: optionTarget.datastore_name || findDatastoreById(clusterId, targetDatastoreId)?.name || "unknown",
+            currentFreeGb: Number(optionTarget.current_free_gb ?? 0),
+            currentUsedPct: Number(optionTarget.current_used_pct ?? 0),
+            projectedFreeGb: Number(optionTarget.projected_free_gb ?? 0),
+            projectedUsedPct: Number(optionTarget.projected_used_pct ?? 0),
+            compatible: Boolean(optionTarget.compatible),
+            reasons: Array.isArray(optionTarget.reasons) ? optionTarget.reasons : []
+          }
+        };
+      }
+
+      const sourceDs = findDatastoreById(clusterId, sourceDatastoreId);
+      const targetDs = findDatastoreById(clusterId, targetDatastoreId);
+      const vmSizeGb = Number(vm?.size_gb);
+      if (!sourceDs || !targetDs || !vm || Number.isNaN(vmSizeGb) || vmSizeGb <= 0) {
+        return null;
+      }
+
+      const sourceFree = Number(sourceDs.free_gb || 0);
+      const targetFree = Number(targetDs.free_gb || 0);
+      const sourceCapacity = Number(sourceDs.capacity_gb || 0);
+      const targetCapacity = Number(targetDs.capacity_gb || 0);
+
+      const sourceProjectedFree = Math.max(0, sourceFree + vmSizeGb);
+      const targetProjectedFree = Math.max(0, targetFree - vmSizeGb);
+
+      const sourceProjectedUsed = sourceCapacity > 0 ? ((sourceCapacity - sourceProjectedFree) / sourceCapacity) * 100 : null;
+      const targetProjectedUsed = targetCapacity > 0 ? ((targetCapacity - targetProjectedFree) / targetCapacity) * 100 : null;
+
+      return {
+        vmName: vm.vm_name || "unknown",
+        vmId: vm.vm_id,
+        vmSizeGb,
+        source: {
+          datastoreId: sourceDs.id,
+          datastoreName: sourceDs.name,
+          currentFreeGb: sourceFree,
+          currentUsedPct: Number(sourceDs.used_pct ?? 0),
+          projectedFreeGb: Number(sourceProjectedFree.toFixed(2)),
+          projectedUsedPct: sourceProjectedUsed === null ? null : Number(sourceProjectedUsed.toFixed(2))
+        },
+        target: {
+          datastoreId: targetDs.id,
+          datastoreName: targetDs.name,
+          currentFreeGb: targetFree,
+          currentUsedPct: Number(targetDs.used_pct ?? 0),
+          projectedFreeGb: Number(targetProjectedFree.toFixed(2)),
+          projectedUsedPct: targetProjectedUsed === null ? null : Number(targetProjectedUsed.toFixed(2)),
+          compatible: true,
+          reasons: []
+        }
+      };
+    }
+
+    function stopMoveTaskPolling() {
+      if (moveTaskPollTimer) {
+        window.clearTimeout(moveTaskPollTimer);
+        moveTaskPollTimer = null;
+      }
+    }
+
+    async function pollMoveTask(taskId, clusterId) {
+      if (!taskId) return;
+
+      state.loading.taskStatus = true;
+      state.errors.taskStatus = "";
+      render();
+
+      try {
+        const payload = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+        state.moveTask = {
+          taskId,
+          state: String(payload?.state || "unknown"),
+          progress: payload?.progress ?? null,
+          error: payload?.error || "",
+          active: !["success", "error"].includes(String(payload?.state || "").toLowerCase())
+        };
+
+        const normalized = String(payload?.state || "").toLowerCase();
+        if (normalized === "success") {
+          showToast("Migração concluída com sucesso.", "success");
+          stopMoveTaskPolling();
+          delete state.clusterDetails[clusterId];
+          const ds = state.selectedDatastore;
+          if (ds.clusterId && ds.datastoreId) {
+            delete state.datastoreVms[datastoreKey(ds.clusterId, ds.datastoreId)];
+            await Promise.all([
+              loadClusterDetail(clusterId, true),
+              loadDatastoreVms(ds.clusterId, ds.datastoreId, true)
+            ]);
+          } else {
+            await loadClusterDetail(clusterId, true);
+          }
+        } else if (normalized === "error") {
+          showToast(payload?.error || "Task de migração falhou.", "error");
+          stopMoveTaskPolling();
+        } else {
+          moveTaskPollTimer = window.setTimeout(() => {
+            pollMoveTask(taskId, clusterId);
+          }, 2500);
+        }
+      } catch (error) {
+        state.errors.taskStatus = error.message;
+        showToast(`Falha ao consultar status da task: ${error.message}`, "error");
+        stopMoveTaskPolling();
+      } finally {
+        state.loading.taskStatus = false;
+        render();
+      }
+    }
+
+    async function warmClusterDetailsForTable() {
+      if (!state.clusters.length) return;
+      if (state.loading.clusterEnhancement) return;
+
+      const missing = state.clusters
+        .map(cluster => cluster.id)
+        .filter(id => id && !state.clusterDetails[id]);
+
+      if (!missing.length) return;
+
+      state.loading.clusterEnhancement = true;
+      render();
+
+      try {
+        await Promise.allSettled(missing.map(id => loadClusterDetail(id, true)));
+      } finally {
+        state.loading.clusterEnhancement = false;
+        render();
+      }
+    }
+
+    async function loadAllRecommendations(force = false) {
+      if (state.loading.allRecommendations && !force) return;
+      if (state.allRecommendations.length && !force) return;
+
+      await loadClusters(force);
+
+      if (!state.clusters.length) {
+        state.allRecommendations = [];
+        render();
+        return;
+      }
+
+      state.loading.allRecommendations = true;
+      state.errors.recommendations = "";
+      render();
+
+      try {
+        const results = await Promise.allSettled(
+          state.clusters.map(async (cluster) => {
+            const recs = await apiFetch(`/api/clusters/${encodeURIComponent(cluster.id)}/recs`);
+            return {
+              clusterId: cluster.id,
+              clusterName: cluster.name,
+              items: Array.isArray(recs) ? recs : []
+            };
+          })
+        );
+
+        const merged = [];
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            const bundle = result.value;
+            state.clusterRecs[bundle.clusterId] = bundle.items;
+            for (const item of bundle.items) {
+              merged.push({
+                ...item,
+                cluster_id: bundle.clusterId,
+                cluster_name: bundle.clusterName
+              });
+            }
+          }
+        }
+
+        state.allRecommendations = merged;
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.recommendations = error.message;
+        state.connected = false;
+      } finally {
+        state.loading.allRecommendations = false;
+        render();
+      }
+    }
+
+    async function loadAllCandidates(force = false) {
+      if (state.loading.allCandidates && !force) return;
+      if (state.allCandidates.length && !force) return;
+
+      await loadClusters(force);
+
+      if (!state.clusters.length) {
+        state.allCandidates = [];
+        render();
+        return;
+      }
+
+      state.loading.allCandidates = true;
+      state.errors.candidates = "";
+      render();
+
+      try {
+        const results = await Promise.allSettled(
+          state.clusters.map(async (cluster) => {
+            const payload = await apiFetch(`/api/clusters/${encodeURIComponent(cluster.id)}/candidates?limit=15`);
+            return {
+              clusterId: cluster.id,
+              clusterName: cluster.name,
+              items: Array.isArray(payload?.items) ? payload.items : []
+            };
+          })
+        );
+
+        const merged = [];
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            const bundle = result.value;
+            for (const item of bundle.items) {
+              merged.push({
+                ...item,
+                cluster_id: bundle.clusterId,
+                cluster_name: bundle.clusterName
+              });
+            }
+          }
+        }
+
+        state.allCandidates = merged;
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.candidates = error.message;
+      } finally {
+        state.loading.allCandidates = false;
+        render();
+      }
+    }
+
+    function invalidateRecommendationCaches(clusterId, recommendationKey) {
+      if (clusterId && state.clusterRecs[clusterId]) {
+        state.clusterRecs[clusterId] = state.clusterRecs[clusterId].filter(rec => rec.key !== recommendationKey);
+      }
+
+      state.allRecommendations = state.allRecommendations.filter(
+        rec => !(rec.cluster_id === clusterId && rec.key === recommendationKey)
+      );
+    }
+
+    async function dismissRecommendation(clusterId, key) {
+      if (!canManageRecommendations()) {
+        showToast("Dismiss bloqueado por política de segurança desta aplicação.", "info");
+        return;
+      }
+
+      if (isReadOnlyMode()) {
+        showToast("Sistema em read-only: dismiss bloqueado durante os testes.", "info");
+        return;
+      }
+
+      state.loading.action = true;
+      render();
+
+      try {
+        const data = await apiFetch(
+          `/api/clusters/${encodeURIComponent(clusterId)}/recs/${encodeURIComponent(key)}/dismiss`,
+          { method: "POST" }
+        );
+
+        if (data?.dismissed) {
+          invalidateRecommendationCaches(clusterId, key);
+          showToast("Recomendação dispensada.", "success");
+        } else {
+          showToast(data?.message || "Dismiss ainda não implementado.", "info");
+        }
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        state.loading.action = false;
+        render();
+      }
+    }
+
+    async function applyRecommendation(clusterId, key) {
+      if (!canManageRecommendations()) {
+        showToast("Apply bloqueado por política de segurança desta aplicação.", "info");
+        return;
+      }
+
+      if (isReadOnlyMode()) {
+        showToast("Sistema em read-only: apply bloqueado durante os testes.", "info");
+        return;
+      }
+
+      state.loading.action = true;
+      render();
+
+      try {
+        const data = await apiFetch(
+          `/api/clusters/${encodeURIComponent(clusterId)}/recs/${encodeURIComponent(key)}/apply`,
+          { method: "POST" }
+        );
+
+        invalidateRecommendationCaches(clusterId, key);
+        showToast(data?.message || "Recomendação aplicada.", "success");
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        state.loading.action = false;
+        state.modal.open = false;
+        render();
+      }
+    }
+
+    async function moveVmToDatastore(clusterId, vmId, sourceDatastoreId, targetDatastoreId) {
+      if (!clusterId || !vmId || !targetDatastoreId) {
+        showToast("Selecione VM e datastore de destino.", "error");
+        return;
+      }
+
+      if (isReadOnlyMode()) {
+        showToast("Sistema em read-only: migração manual bloqueada durante os testes.", "info");
+        state.moveConfirm.open = false;
+        render();
+        return;
+      }
+
+      state.loading.vmMove = true;
+      state.errors.vmMove = "";
+      render();
+
+      try {
+        const payload = {
+          target_datastore_id: targetDatastoreId,
+          source_datastore_id: sourceDatastoreId || null
+        };
+        const optionsKey = moveVmKey(clusterId, sourceDatastoreId || "", vmId);
+        const data = await apiFetch(
+          `/api/clusters/${encodeURIComponent(clusterId)}/vms/${encodeURIComponent(vmId)}/move`,
+          {
+            method: "POST",
+            headers: {
+              "X-Confirm-Storage-Move": "yes"
+            },
+            body: payload
+          }
+        );
+
+        state.moveConfirm.open = false;
+        state.moveTask = {
+          taskId: data?.task_id || "",
+          state: "queued",
+          progress: 0,
+          error: "",
+          active: true
+        };
+        showToast(data?.message || "Storage vMotion enfileirada.", "success");
+
+        const ds = state.selectedDatastore;
+        if (ds.clusterId && ds.datastoreId) {
+          const key = datastoreKey(ds.clusterId, ds.datastoreId);
+          delete state.datastoreVms[key];
+          await loadDatastoreVms(ds.clusterId, ds.datastoreId, true);
+        }
+        delete state.moveOptionsByVm[optionsKey];
+        state.moveForm.targetDatastoreId = "";
+        state.movePreview = null;
+
+        delete state.clusterDetails[clusterId];
+        await loadClusterDetail(clusterId, true);
+
+        if (data?.task_id) {
+          stopMoveTaskPolling();
+          await pollMoveTask(data.task_id, clusterId);
+        }
+      } catch (error) {
+        state.errors.vmMove = error.message;
+        showToast(error.message, "error");
+      } finally {
+        state.loading.vmMove = false;
+        render();
+      }
+    }
+
+    function openApplyModal(clusterId, key, title) {
+      if (!canManageRecommendations()) {
+        showToast("Apply bloqueado por política de segurança desta aplicação.", "info");
+        return;
+      }
+
+      if (isReadOnlyMode()) {
+        showToast("Sistema em read-only: apply bloqueado durante os testes.", "info");
+        return;
+      }
+
+      state.modal = {
+        open: true,
+        clusterId,
+        key,
+        title: title || "Confirmar aplicação",
+        body: "Essa ação pode disparar a aplicação manual de uma recomendação do Storage DRS. Nenhum movimento deve acontecer sem sua confirmação explícita."
+      };
+      render();
+    }
+
+    function closeModal() {
+      state.modal.open = false;
+      render();
+    }
+
+    async function openDatastoreVms(clusterId, datastoreId, datastoreName) {
+      if (!clusterId || !datastoreId) return;
+      stopMoveTaskPolling();
+      state.moveTask = {
+        taskId: "",
+        state: "",
+        progress: null,
+        error: "",
+        active: false
+      };
+      state.selectedDatastore = {
+        clusterId,
+        datastoreId,
+        datastoreName: datastoreName || datastoreId
+      };
+      state.moveForm = {
+        clusterId,
+        sourceDatastoreId: datastoreId,
+        vmId: "",
+        targetDatastoreId: ""
+      };
+      state.movePreview = null;
+      state.moveConfirm.open = false;
+      state.errors.moveOptions = "";
+      state.errors.taskStatus = "";
+      render();
+      await loadDatastoreVms(clusterId, datastoreId);
+    }
+
+    function openMoveConfirmModal() {
+      const form = state.moveForm;
+      const preview = buildMovePreview(form.clusterId, form.sourceDatastoreId, form.targetDatastoreId, form.vmId);
+      if (!preview) {
+        showToast("Preencha VM e destino válidos para visualizar a projeção.", "error");
+        return;
+      }
+
+      if (!preview.target.compatible) {
+        const reasons = Array.isArray(preview.target.reasons) ? preview.target.reasons.map(humanizeMoveReason).join(" | ") : "";
+        showToast(`Destino incompatível para migração. ${reasons}`, "error");
+        return;
+      }
+
+      state.movePreview = preview;
+      state.moveConfirm = {
+        open: true,
+        clusterId: form.clusterId,
+        vmId: form.vmId,
+        vmName: preview.vmName,
+        sourceDatastoreId: form.sourceDatastoreId,
+        sourceDatastoreName: preview.source.datastoreName,
+        targetDatastoreId: form.targetDatastoreId,
+        targetDatastoreName: preview.target.datastoreName,
+        sizeGb: preview.vmSizeGb
+      };
+      render();
+    }
+
+    function closeMoveConfirmModal() {
+      state.moveConfirm.open = false;
+      render();
+    }
+
+    function getClusterLatencySummary(clusterId) {
+      const detail = state.clusterDetails[clusterId];
+      if (!detail?.datastores?.length) return null;
+
+      const values = detail.datastores
+        .map(ds => ds.latency_ms)
+        .filter(v => v !== null && v !== undefined && !Number.isNaN(Number(v)))
+        .map(Number);
+
+      if (!values.length) return null;
+      const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+      return Number(avg.toFixed(2));
+    }
+
+    function computeKpis() {
+      const totalClusters = state.clusters.length;
+      const sdrsActive = state.clusters.filter(cluster => cluster.sdrs_enabled).length;
+      const pendingRecommendations = state.allRecommendations.length;
+      const totalFreeGb = state.clusters.reduce((sum, cluster) => sum + Number(cluster.total_free_gb || 0), 0);
+
+      return {
+        totalClusters,
+        sdrsActive,
+        pendingRecommendations,
+        totalFreeGb
+      };
+    }
+
+    function navItem(routeName, icon, label, href) {
+      const active = state.route.name === routeName;
+      return `
+        <a
+          href="${href}"
+          class="flex items-center gap-3 rounded-2xl px-4 py-3 border transition ${
+            active
+              ? "bg-slate-900 text-slate-100 border-slate-800"
+              : "text-slate-300 hover:bg-slate-900 border-transparent hover:border-slate-800"
+          }"
+        >
+          <i data-lucide="${icon}" class="w-4 h-4"></i>
+          <span class="text-sm font-medium">${escapeHtml(label)}</span>
+        </a>
+      `;
+    }
+
+    function skeletonCard() {
+      const theme = getThemeClasses();
+      return `
+        <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+          <div class="skeleton h-4 w-28 rounded-full mb-5"></div>
+          <div class="skeleton h-10 w-24 rounded-2xl mb-3"></div>
+          <div class="skeleton h-3 w-40 rounded-full"></div>
+        </div>
+      `;
+    }
+
+    function emptyState(title, message) {
+      const theme = getThemeClasses();
+      return `
+        <div class="rounded-3xl border p-10 text-center ${theme.empty}">
+          <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-900/5">
+            <i data-lucide="database-zap" class="h-6 w-6"></i>
+          </div>
+          <h3 class="text-lg font-semibold mb-2">${escapeHtml(title)}</h3>
+          <p class="text-sm">${escapeHtml(message)}</p>
+        </div>
+      `;
+    }
+
+    function errorBanner(message) {
+      if (!message) return "";
+      return `
+        <div class="mb-6 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          ${escapeHtml(message)}
+        </div>
+      `;
+    }
+
+    function renderDashboard() {
+      const theme = getThemeClasses();
+      const kpi = computeKpis();
+
+      const cards = state.loading.clusters || state.loading.allRecommendations
+        ? Array.from({ length: 4 }).map(() => skeletonCard()).join("")
+        : `
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <div class="mb-4 flex items-center justify-between">
+              <p class="text-sm ${theme.subtle}">Total Clusters</p>
+              <i data-lucide="folder-tree" class="w-5 h-5 ${theme.subtle}"></i>
+            </div>
+            <p class="text-3xl font-bold">${formatNumber(kpi.totalClusters)}</p>
+            <p class="mt-2 text-sm ${theme.subtle}">Datastore clusters encontrados no vCenter</p>
+          </div>
+
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <div class="mb-4 flex items-center justify-between">
+              <p class="text-sm ${theme.subtle}">SDRS Active</p>
+              <i data-lucide="activity" class="w-5 h-5 ${theme.subtle}"></i>
+            </div>
+            <p class="text-3xl font-bold">${formatNumber(kpi.sdrsActive)}</p>
+            <p class="mt-2 text-sm ${theme.subtle}">Clusters com Storage DRS habilitado</p>
+          </div>
+
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <div class="mb-4 flex items-center justify-between">
+              <p class="text-sm ${theme.subtle}">Pending Recommendations</p>
+              <i data-lucide="arrow-right-left" class="w-5 h-5 ${theme.subtle}"></i>
+            </div>
+            <p class="text-3xl font-bold">${formatNumber(kpi.pendingRecommendations)}</p>
+            <p class="mt-2 text-sm ${theme.subtle}">Moves sugeridos aguardando revisão</p>
+          </div>
+
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <div class="mb-4 flex items-center justify-between">
+              <p class="text-sm ${theme.subtle}">Total Free Space</p>
+              <i data-lucide="hard-drive" class="w-5 h-5 ${theme.subtle}"></i>
+            </div>
+            <p class="text-3xl font-bold">${formatGb(kpi.totalFreeGb)}</p>
+            <p class="mt-2 text-sm ${theme.subtle}">Capacidade livre somada entre os clusters</p>
+          </div>
+        `;
+
+      let tableContent = "";
+
+      if (state.loading.clusters) {
+        tableContent = `
+          <div class="space-y-3 p-6">
+            ${Array.from({ length: 5 }).map(() => `<div class="skeleton h-14 rounded-2xl"></div>`).join("")}
+          </div>
+        `;
+      } else if (!state.clusters.length) {
+        tableContent = `<div class="p-6">${emptyState("Nenhum cluster encontrado", "Verifique a conexão com o vCenter e se há datastore clusters com SDRS habilitado.")}</div>`;
+      } else {
+        tableContent = `
+          <div class="overflow-x-auto thin-scrollbar">
+            <table class="min-w-full">
+              <thead class="${theme.tableHead}">
+                <tr>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Cluster</th>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Automation</th>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Datastores</th>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Free Space</th>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Status</th>
+                  <th class="px-6 py-4 text-right text-xs font-semibold uppercase tracking-wide">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${state.clusters.map((cluster) => `
+                  <tr class="border-t ${theme.rowBorder}">
+                    <td class="px-6 py-4">
+                      <div class="font-semibold">${escapeHtml(cluster.name)}</div>
+                      <div class="text-xs ${theme.subtle}">${escapeHtml(cluster.id || "")}</div>
+                    </td>
+                    <td class="px-6 py-4">${statusBadge(cluster.sdrs_automation_level || "Unknown", cluster.sdrs_enabled ? "teal" : "amber")}</td>
+                    <td class="px-6 py-4">${formatNumber(cluster.datastore_count || 0)}</td>
+                    <td class="px-6 py-4">${formatGb(cluster.total_free_gb)}</td>
+                    <td class="px-6 py-4">
+                      ${cluster.sdrs_enabled ? statusBadge("Enabled", "emerald") : statusBadge("Disabled", "amber")}
+                    </td>
+                    <td class="px-6 py-4 text-right">
+                      <button
+                        data-action="view-cluster"
+                        data-cluster-id="${escapeHtml(cluster.id)}"
+                        class="inline-flex items-center rounded-2xl border border-teal-200 bg-teal-50 px-3 py-2 text-sm font-semibold text-teal-700 hover:bg-teal-100"
+                      >
+                        View details
+                      </button>
+                    </td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      return `
+        ${errorBanner(state.errors.health || state.errors.clusters || state.connectionError)}
+        <section class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6 mb-8">
+          ${cards}
+        </section>
+
+        <section class="rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex items-center justify-between">
+            <div>
+              <h3 class="text-lg font-semibold">Cluster overview</h3>
+              <p class="text-sm ${theme.subtle}">Resumo operacional dos datastore clusters</p>
+            </div>
+            <button
+              data-action="refresh-dashboard"
+              class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+            >
+              <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+              Refresh
+            </button>
+          </div>
+          ${tableContent}
+        </section>
+      `;
+    }
+
+    function renderClusters() {
+      const theme = getThemeClasses();
+
+      if (state.loading.clusters) {
+        return `
+          ${errorBanner(state.errors.clusters)}
+          <section class="space-y-6">
+            ${Array.from({ length: 4 }).map(() => skeletonCard()).join("")}
+            <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+              ${Array.from({ length: 6 }).map(() => `<div class="skeleton h-14 rounded-2xl mb-3"></div>`).join("")}
+            </div>
+          </section>
+        `;
+      }
+
+      if (!state.clusters.length) {
+        return `${errorBanner(state.errors.clusters)}${emptyState("Nenhum cluster disponível", "Quando o backend conseguir ler os datastore clusters, eles aparecerão aqui.")}`;
+      }
+
+      return `
+        ${errorBanner(state.errors.clusters)}
+        <section class="rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <h3 class="text-lg font-semibold">Clusters</h3>
+              <p class="text-sm ${theme.subtle}">Lista completa com status SDRS, free space e latência média</p>
+            </div>
+            <div class="flex items-center gap-2">
+              ${state.loading.clusterEnhancement ? statusBadge("Loading latency", "sky") : ""}
+              <button
+                data-action="refresh-clusters"
+                class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+              >
+                <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                Refresh
+              </button>
+            </div>
+          </div>
+
+          <div class="overflow-x-auto thin-scrollbar">
+            <table class="min-w-full">
+              <thead class="${theme.tableHead}">
+                <tr>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Name</th>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">SDRS Status</th>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Datastores</th>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Free Space</th>
+                  <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">I/O Latency</th>
+                  <th class="px-6 py-4 text-right text-xs font-semibold uppercase tracking-wide">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${state.clusters.map((cluster) => {
+                  const latency = getClusterLatencySummary(cluster.id);
+                  const detailLoaded = !!state.clusterDetails[cluster.id];
+
+                  return `
+                    <tr
+                      class="border-t ${theme.rowBorder} cursor-pointer ${theme.hover}"
+                      data-action="view-cluster"
+                      data-cluster-id="${escapeHtml(cluster.id)}"
+                    >
+                      <td class="px-6 py-4">
+                        <div class="font-semibold">${escapeHtml(cluster.name)}</div>
+                        <div class="text-xs ${theme.subtle}">
+                          Free threshold: ${cluster.free_space_threshold ?? "—"} GB · IO threshold: ${cluster.io_latency_threshold ?? "—"}
+                        </div>
+                      </td>
+                      <td class="px-6 py-4">
+                        ${statusBadge(cluster.sdrs_automation_level || "Unknown", cluster.sdrs_enabled ? "teal" : "amber")}
+                      </td>
+                      <td class="px-6 py-4">${formatNumber(cluster.datastore_count || 0)}</td>
+                      <td class="px-6 py-4">${formatGb(cluster.total_free_gb)}</td>
+                      <td class="px-6 py-4">
+                        ${
+                          detailLoaded
+                            ? (latency !== null ? statusBadge(formatMs(latency), latency > 20 ? "amber" : "emerald") : statusBadge("Unavailable", "slate"))
+                            : '<div class="skeleton h-6 w-24 rounded-full"></div>'
+                        }
+                      </td>
+                      <td class="px-6 py-4 text-right">
+                        <button
+                          data-action="view-cluster"
+                          data-cluster-id="${escapeHtml(cluster.id)}"
+                          class="inline-flex items-center rounded-2xl border border-slate-200 px-3 py-2 text-sm font-semibold hover:bg-slate-50"
+                        >
+                          View details
+                        </button>
+                      </td>
+                    </tr>
+                  `;
+                }).join("")}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      `;
+    }
+
+    function renderClusterDetail() {
+      const theme = getThemeClasses();
+      const readOnly = isReadOnlyMode();
+      const recommendationActionsAllowed = canManageRecommendations() && !readOnly;
+      const clusterId = state.route.clusterId;
+      const detail = state.clusterDetails[clusterId];
+      const recs = state.clusterRecs[clusterId] || [];
+      const candidatesPayload = state.clusterCandidates[clusterId] || { items: [] };
+      const candidates = Array.isArray(candidatesPayload.items) ? candidatesPayload.items : [];
+      const simulationPayload = state.clusterSimulation[clusterId] || { items: [] };
+      const simulatedItems = Array.isArray(simulationPayload.items) ? simulationPayload.items : [];
+
+      if (state.loading.clusterDetail && !detail) {
+        return `
+          <section class="space-y-6">
+            <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+              <div class="skeleton h-7 w-64 rounded-2xl mb-3"></div>
+              <div class="skeleton h-4 w-96 rounded-full"></div>
+            </div>
+            <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+              ${Array.from({ length: 6 }).map(() => skeletonCard()).join("")}
+            </div>
+          </section>
+        `;
+      }
+
+      if (!detail) {
+        return `${errorBanner(state.errors.clusterDetail)}${emptyState("Cluster não encontrado", "Não foi possível carregar os detalhes desse datastore cluster.")}`;
+      }
+
+      const datastores = Array.isArray(detail.datastores) ? detail.datastores : [];
+      const selectedDs = state.selectedDatastore;
+
+      return `
+        ${renderReadOnlyBanner()}
+        ${errorBanner(state.errors.clusterDetail || state.errors.clusterRecommendations || state.errors.clusterCandidates || state.errors.clusterSimulation || state.errors.datastoreVms || state.errors.moveOptions || state.errors.taskStatus || state.errors.vmMove)}
+        <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider}">
+            <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+              <div>
+                <div class="mb-2">
+                  <a href="#clusters" class="text-sm font-semibold text-teal-600 hover:text-teal-700">← Back to Clusters</a>
+                </div>
+                <h3 class="text-2xl font-bold">${escapeHtml(detail.name)}</h3>
+                <p class="mt-2 text-sm ${theme.subtle}">
+                  Cluster ID: ${escapeHtml(detail.id || clusterId)}
+                </p>
+              </div>
+
+              <div class="flex flex-wrap gap-2">
+                ${detail.sdrs_enabled ? statusBadge("SDRS Enabled", "emerald") : statusBadge("SDRS Disabled", "amber")}
+                ${statusBadge(detail.sdrs_automation_level || "Unknown", "teal")}
+                ${statusBadge(`Datastores ${detail.datastore_count ?? 0}`, "sky")}
+                ${statusBadge(`Free threshold ${detail.free_space_threshold ?? "—"} GB`, "violet")}
+                ${statusBadge(`IO threshold ${detail.io_latency_threshold ?? "—"}`, "slate")}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="mb-8">
+          <div class="mb-4 flex items-center justify-between">
+            <div>
+              <h4 class="text-lg font-semibold">Member datastores</h4>
+              <p class="text-sm ${theme.subtle}">Uso, espaço livre e latência por datastore</p>
+            </div>
+            <button
+              data-action="refresh-cluster"
+              data-cluster-id="${escapeHtml(clusterId)}"
+              class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+            >
+              <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+              Refresh
+            </button>
+          </div>
+
+          ${
+            datastores.length
+              ? `
+                <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                  ${datastores.map((ds) => `
+                    <div class="rounded-3xl border p-5 shadow-soft ${theme.panel} ${selectedDs.clusterId === clusterId && selectedDs.datastoreId === ds.id ? "ring-2 ring-teal-400" : ""}">
+                      <div class="flex items-start justify-between gap-3 mb-4">
+                        <div>
+                          <h5 class="font-semibold leading-tight">${escapeHtml(ds.name)}</h5>
+                          <p class="text-sm ${theme.subtle}">
+                            Capacity ${formatGb(ds.capacity_gb)} · Free ${formatGb(ds.free_gb)}
+                          </p>
+                        </div>
+                        ${
+                          ds.latency_ms !== null && ds.latency_ms !== undefined
+                            ? statusBadge(formatMs(ds.latency_ms), Number(ds.latency_ms) > 20 ? "amber" : "emerald")
+                            : statusBadge("Latency n/a", "slate")
+                        }
+                      </div>
+
+                      <div class="mb-3">
+                        <div class="mb-2 flex items-center justify-between text-sm">
+                          <span class="${theme.subtle}">Used</span>
+                          <span class="font-semibold">${formatPct(ds.used_pct)}</span>
+                        </div>
+                        <div class="h-3 rounded-full bg-slate-200 overflow-hidden">
+                          <div
+                            class="h-full rounded-full ${
+                              Number(ds.used_pct || 0) > 85
+                                ? "bg-amber-500"
+                                : Number(ds.used_pct || 0) > 65
+                                  ? "bg-sky-500"
+                                  : "bg-teal-500"
+                            }"
+                            style="width: ${Math.min(100, Math.max(0, Number(ds.used_pct || 0)))}%"
+                          ></div>
+                        </div>
+                      </div>
+
+                      <div class="grid grid-cols-2 gap-3 text-sm">
+                        <div class="rounded-2xl border ${theme.rowBorder} p-3">
+                          <div class="${theme.subtle} mb-1">Used %</div>
+                          <div class="font-semibold">${formatPct(ds.used_pct)}</div>
+                        </div>
+                        <div class="rounded-2xl border ${theme.rowBorder} p-3">
+                          <div class="${theme.subtle} mb-1">Free</div>
+                          <div class="font-semibold">${formatGb(ds.free_gb)}</div>
+                        </div>
+                      </div>
+
+                      <div class="mt-4">
+                        <button
+                          data-action="view-datastore-page"
+                          data-cluster-id="${escapeHtml(clusterId)}"
+                          data-datastore-id="${escapeHtml(ds.id)}"
+                          data-datastore-name="${escapeHtml(ds.name)}"
+                          class="inline-flex items-center rounded-2xl border border-slate-200 px-3 py-2 text-sm font-semibold hover:bg-slate-50"
+                        >
+                          Abrir datastore
+                        </button>
+                      </div>
+                    </div>
+                  `).join("")}
+                </div>
+              `
+              : emptyState("Sem datastores", "Esse cluster não retornou membros no momento.")
+          }
+        </section>
+
+        <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider}">
+            <h4 class="text-lg font-semibold">Nova experiência por datastore</h4>
+            <p class="text-sm ${theme.subtle}">
+              Clique em <span class="font-semibold">Abrir datastore</span> em qualquer card acima para entrar na página dedicada com VMs, projeção de espaço e planejamento de migração.
+            </p>
+          </div>
+        </section>
+
+        <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex items-center justify-between">
+            <div>
+              <h4 class="text-lg font-semibold">What-if plan (read-only)</h4>
+              <p class="text-sm ${theme.subtle}">
+                Simulação de até ${formatNumber(simulationPayload.max_moves || 3)} movimentos sem executar nada no vCenter.
+              </p>
+            </div>
+            <button
+              data-action="refresh-cluster-simulation"
+              data-cluster-id="${escapeHtml(clusterId)}"
+              class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+            >
+              <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+              Recalcular
+            </button>
+          </div>
+
+          ${
+            state.loading.clusterSimulation && !state.clusterSimulation[clusterId]
+              ? `<div class="p-6 space-y-3">${Array.from({ length: 3 }).map(() => `<div class="skeleton h-14 rounded-2xl"></div>`).join("")}</div>`
+              : !simulatedItems.length
+                ? `<div class="p-6">${emptyState("Sem plano simulado", "Não houve combinação segura de movimentos para o cenário atual.")}</div>`
+                : `
+                  <div class="p-6 border-b ${theme.divider}">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div class="rounded-2xl border ${theme.rowBorder} p-4">
+                        <div class="text-xs ${theme.subtle} mb-1">Imbalance Before → After</div>
+                        <div class="font-semibold">
+                          ${formatPct(simulationPayload.before?.space_imbalance_pct)} → ${formatPct(simulationPayload.after?.space_imbalance_pct)}
+                        </div>
+                        <div class="text-xs ${theme.subtle} mt-1">
+                          Delta: ${formatNumber(simulationPayload.delta?.space_imbalance_pct_delta, 2)} pp
+                        </div>
+                      </div>
+                      <div class="rounded-2xl border ${theme.rowBorder} p-4">
+                        <div class="text-xs ${theme.subtle} mb-1">Avg Used Before → After</div>
+                        <div class="font-semibold">
+                          ${formatPct(simulationPayload.before?.avg_used_pct)} → ${formatPct(simulationPayload.after?.avg_used_pct)}
+                        </div>
+                        <div class="text-xs ${theme.subtle} mt-1">
+                          Candidatos avaliados: ${formatNumber(simulationPayload.source_candidates || 0)}
+                        </div>
+                      </div>
+                      <div class="rounded-2xl border ${theme.rowBorder} p-4">
+                        <div class="text-xs ${theme.subtle} mb-1">Guardrails</div>
+                        <div class="text-sm">
+                          Headroom min ${formatNumber(simulationPayload.policy?.min_free_headroom_pct, 1)}% · Max used ${formatNumber(simulationPayload.policy?.max_target_used_pct, 1)}%
+                        </div>
+                        <div class="text-xs ${theme.subtle} mt-1">
+                          Max concurrent: ${formatNumber(simulationPayload.policy?.max_concurrent_per_cluster || 0)}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="overflow-x-auto thin-scrollbar">
+                    <table class="min-w-full">
+                      <thead class="${theme.tableHead}">
+                        <tr>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">VM</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Source → Target</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Projected Used</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Score</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${simulatedItems.map((item) => `
+                          <tr class="border-t ${theme.rowBorder}">
+                            <td class="px-6 py-4">
+                              <div class="font-medium">${escapeHtml(item.vm_name || "unknown")}</div>
+                              <div class="text-xs ${theme.subtle}">${formatGb(item.size_gb)}</div>
+                            </td>
+                            <td class="px-6 py-4">
+                              <div class="font-medium">${escapeHtml(item.source_ds || "—")} → ${escapeHtml(item.target_ds || "—")}</div>
+                            </td>
+                            <td class="px-6 py-4">
+                              ${formatPct(item.source_used_after_pct)} → ${formatPct(item.target_used_after_pct)}
+                            </td>
+                            <td class="px-6 py-4">
+                              ${statusBadge(formatNumber(item.score || 0), Number(item.score || 0) >= 70 ? "emerald" : "amber")}
+                            </td>
+                          </tr>
+                        `).join("")}
+                      </tbody>
+                    </table>
+                  </div>
+                `
+          }
+        </section>
+
+        <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex items-center justify-between">
+            <div>
+              <h4 class="text-lg font-semibold">Suggested VM moves (read-only)</h4>
+              <p class="text-sm ${theme.subtle}">
+                Candidatos heurísticos quando não existem recomendações pendentes do SDRS
+              </p>
+            </div>
+            ${
+              state.loading.clusterCandidates
+                ? statusBadge("Loading", "sky")
+                : statusBadge(`${candidates.length} candidates`, candidates.length ? "teal" : "slate")
+            }
+          </div>
+
+          ${
+            state.loading.clusterCandidates && !state.clusterCandidates[clusterId]
+              ? `<div class="p-6 space-y-3">${Array.from({ length: 4 }).map(() => `<div class="skeleton h-14 rounded-2xl"></div>`).join("")}</div>`
+              : !candidates.length
+                ? `
+                  <div class="p-6">
+                    ${emptyState(
+                      "Sem candidatos no momento",
+                      "Não há VMs com bom ganho de balanceamento para mover neste cluster agora."
+                    )}
+                  </div>
+                `
+                : `
+                  <div class="overflow-x-auto thin-scrollbar">
+                    <table class="min-w-full">
+                      <thead class="${theme.tableHead}">
+                        <tr>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">VM</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Size</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Source → Target</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">After Move</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Balance gain</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Score</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Reason</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${candidates.map((cand) => `
+                          <tr class="border-t ${theme.rowBorder}">
+                            <td class="px-6 py-4">
+                              <div class="font-medium">${escapeHtml(cand.vm_name || "unknown")}</div>
+                              <div class="text-xs ${theme.subtle}">${escapeHtml(cand.vm_id || "")}</div>
+                            </td>
+                            <td class="px-6 py-4">${formatGb(cand.size_gb)}</td>
+                            <td class="px-6 py-4">
+                              <div class="font-medium">${escapeHtml(cand.source_ds || "—")} → ${escapeHtml(cand.target_ds || "—")}</div>
+                              <div class="text-xs ${theme.subtle}">
+                                ${formatPct(cand.source_used_pct)} → ${formatPct(cand.target_used_pct)}
+                              </div>
+                            </td>
+                            <td class="px-6 py-4">
+                              <div class="font-medium">
+                                ${formatPct(cand.source_used_after_pct)} → ${formatPct(cand.target_used_after_pct)}
+                              </div>
+                            </td>
+                            <td class="px-6 py-4">
+                              ${statusBadge(`${formatNumber(cand.balance_gain_pct || 0, 2)} pp`, Number(cand.balance_gain_pct || 0) >= 2 ? "emerald" : "slate")}
+                            </td>
+                            <td class="px-6 py-4">
+                              ${statusBadge(formatNumber(cand.score || 0), Number(cand.score || 0) >= 70 ? "emerald" : "amber")}
+                            </td>
+                            <td class="px-6 py-4">
+                              <div class="text-sm ${theme.subtle}">${escapeHtml(cand.reason || "Heurística de balanceamento")}</div>
+                            </td>
+                          </tr>
+                        `).join("")}
+                      </tbody>
+                    </table>
+                  </div>
+                `
+          }
+        </section>
+
+        <section class="rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex items-center justify-between">
+            <div>
+              <h4 class="text-lg font-semibold">Recommendations</h4>
+              <p class="text-sm ${theme.subtle}">Recomendações pendentes só deste cluster</p>
+            </div>
+            ${
+              state.loading.clusterRecommendations
+                ? statusBadge("Loading", "sky")
+                : statusBadge(`${recs.length} pending`, recs.length ? "amber" : "slate")
+            }
+          </div>
+
+          ${
+            state.loading.clusterRecommendations && !state.clusterRecs[clusterId]
+              ? `<div class="p-6 space-y-3">${Array.from({ length: 4 }).map(() => `<div class="skeleton h-14 rounded-2xl"></div>`).join("")}</div>`
+              : !recs.length
+                ? `<div class="p-6">${emptyState("Sem recomendações pendentes", "Nenhuma sugestão de Storage DRS foi retornada para este cluster.")}</div>`
+                : `
+                  <div class="overflow-x-auto thin-scrollbar">
+                    <table class="min-w-full">
+                      <thead class="${theme.tableHead}">
+                        <tr>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Type</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Reason</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Source → Target</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">VM</th>
+                          <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Size</th>
+                          <th class="px-6 py-4 text-right text-xs font-semibold uppercase tracking-wide">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${recs.map((rec) => `
+                          <tr class="border-t ${theme.rowBorder}">
+                            <td class="px-6 py-4">${statusBadge(rec.type || "Recommendation", "violet")}</td>
+                            <td class="px-6 py-4">
+                              <div class="font-medium">${escapeHtml(rec.reason || "No reason provided")}</div>
+                              <div class="text-xs ${theme.subtle}">${escapeHtml(rec.key || "")}</div>
+                            </td>
+                            <td class="px-6 py-4">
+                              <div class="font-medium">${escapeHtml(rec.source_ds || "—")} → ${escapeHtml(rec.target_ds || "—")}</div>
+                            </td>
+                            <td class="px-6 py-4">${escapeHtml(rec.vm_name || "—")}</td>
+                            <td class="px-6 py-4">${formatGb(rec.size_gb)}</td>
+                            <td class="px-6 py-4">
+                              ${
+                                recommendationActionsAllowed
+                                  ? `
+                                    <div class="flex justify-end gap-2">
+                                      <button
+                                        data-action="open-apply-modal"
+                                        data-cluster-id="${escapeHtml(clusterId)}"
+                                        data-key="${escapeHtml(rec.key)}"
+                                        data-title="Apply recommendation"
+                                        class="inline-flex items-center rounded-2xl px-3 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700"
+                                      >
+                                        Apply
+                                      </button>
+                                      <button
+                                        data-action="dismiss-recommendation"
+                                        data-cluster-id="${escapeHtml(clusterId)}"
+                                        data-key="${escapeHtml(rec.key)}"
+                                        class="inline-flex items-center rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+                                      >
+                                        Dismiss
+                                      </button>
+                                    </div>
+                                  `
+                                  : `<div class="flex justify-end">${statusBadge("Blocked by policy", "amber")}</div>`
+                              }
+                            </td>
+                          </tr>
+                        `).join("")}
+                      </tbody>
+                    </table>
+                  </div>
+                `
+          }
+        </section>
+      `;
+    }
+
+    function renderDatastoreDetail() {
+      const theme = getThemeClasses();
+      const readOnly = isReadOnlyMode();
+      const clusterId = state.route.clusterId;
+      const datastoreId = state.route.datastoreId;
+      const detail = state.clusterDetails[clusterId];
+
+      if (state.loading.clusterDetail && !detail) {
+        return `
+          <section class="space-y-6">
+            <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+              <div class="skeleton h-7 w-72 rounded-2xl mb-3"></div>
+              <div class="skeleton h-4 w-96 rounded-full"></div>
+            </div>
+            <div class="grid grid-cols-1 xl:grid-cols-4 gap-6">
+              ${Array.from({ length: 4 }).map(() => skeletonCard()).join("")}
+            </div>
+          </section>
+        `;
+      }
+
+      if (!detail) {
+        return `${errorBanner(state.errors.clusterDetail)}${emptyState("Cluster não encontrado", "Não foi possível carregar o cluster deste datastore.")}`;
+      }
+
+      const datastore = findDatastoreById(clusterId, datastoreId);
+      if (!datastore) {
+        return `${errorBanner(state.errors.clusterDetail || state.errors.datastoreVms)}${emptyState("Datastore não encontrado", "Este datastore não foi localizado no cluster informado.")}`;
+      }
+
+      const key = datastoreKey(clusterId, datastoreId);
+      const payload = state.datastoreVms[key] || { items: [] };
+      const vms = Array.isArray(payload.items) ? payload.items : [];
+      const poweredOnCount = vms.filter((vm) => String(vm.power_state || "").toLowerCase() === "poweredon").length;
+      const poweredOffCount = vms.length - poweredOnCount;
+      const totalVmSizeGb = vms.reduce((sum, vm) => sum + Number(vm.size_gb || 0), 0);
+
+      const formMatchesSource = state.moveForm.clusterId === clusterId && state.moveForm.sourceDatastoreId === datastoreId;
+      const form = formMatchesSource
+        ? state.moveForm
+        : { clusterId, sourceDatastoreId: datastoreId, vmId: "", targetDatastoreId: "" };
+      const moveOptions = getMoveOptionsForForm(clusterId, datastoreId, form.vmId);
+      const moveTargets = Array.isArray(moveOptions?.targets) ? moveOptions.targets : [];
+      const allDatastores = Array.isArray(detail.datastores) ? detail.datastores : [];
+      const fallbackTargets = allDatastores
+        .filter((ds) => ds.id !== datastoreId)
+        .map((ds) => ({
+          datastore_id: ds.id,
+          datastore_name: ds.name,
+          current_used_pct: ds.used_pct,
+          projected_used_pct: null,
+          compatible: true,
+          reasons: []
+        }));
+      const destinationOptions = moveTargets.length ? moveTargets : fallbackTargets;
+      const selectedTargetOption = destinationOptions.find((item) => item.datastore_id === form.targetDatastoreId) || null;
+      const selectedTargetCompatible = selectedTargetOption ? Boolean(selectedTargetOption.compatible) : true;
+      const selectedTargetReasons = selectedTargetOption && Array.isArray(selectedTargetOption.reasons)
+        ? selectedTargetOption.reasons
+        : [];
+      const hasMoveSelection = Boolean(form.vmId && form.targetDatastoreId);
+      const activePreview = buildMovePreview(clusterId, datastoreId, form.targetDatastoreId, form.vmId);
+
+      return `
+        ${renderReadOnlyBanner()}
+        ${errorBanner(state.errors.clusterDetail || state.errors.clusterSimulation || state.errors.datastoreVms || state.errors.moveOptions || state.errors.taskStatus || state.errors.vmMove)}
+
+        <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider}">
+            <div class="mb-3">
+              <a href="#cluster/${encodeURIComponent(clusterId)}" class="text-sm font-semibold text-teal-600 hover:text-teal-700">← Voltar para o cluster</a>
+            </div>
+            <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+              <div>
+                <h3 class="text-2xl font-bold">${escapeHtml(datastore.name)}</h3>
+                <p class="mt-2 text-sm ${theme.subtle}">
+                  Datastore ID: ${escapeHtml(datastore.id || datastoreId)} · Cluster: ${escapeHtml(detail.name || clusterId)}
+                </p>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                ${statusBadge(`Used ${formatPct(datastore.used_pct)}`, Number(datastore.used_pct || 0) > 85 ? "amber" : "emerald")}
+                ${statusBadge(`Free ${formatGb(datastore.free_gb)}`, "sky")}
+                ${datastore.latency_ms !== null && datastore.latency_ms !== undefined ? statusBadge(`Latency ${formatMs(datastore.latency_ms)}`, Number(datastore.latency_ms) > 20 ? "amber" : "emerald") : statusBadge("Latency n/a", "slate")}
+                ${statusBadge(`VMs ${formatNumber(vms.length)}`, "teal")}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="mb-8 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <p class="text-sm ${theme.subtle} mb-2">Capacidade</p>
+            <p class="text-2xl font-bold">${formatGb(datastore.capacity_gb)}</p>
+          </div>
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <p class="text-sm ${theme.subtle} mb-2">Espaço Livre</p>
+            <p class="text-2xl font-bold">${formatGb(datastore.free_gb)}</p>
+          </div>
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <p class="text-sm ${theme.subtle} mb-2">VMs Ligadas / Desligadas</p>
+            <p class="text-2xl font-bold">${formatNumber(poweredOnCount)} / ${formatNumber(poweredOffCount)}</p>
+          </div>
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <p class="text-sm ${theme.subtle} mb-2">Soma de discos das VMs</p>
+            <p class="text-2xl font-bold">${formatGb(totalVmSizeGb)}</p>
+          </div>
+        </section>
+
+        <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex items-center justify-between">
+            <div>
+              <h4 class="text-lg font-semibold">Planejamento de migração</h4>
+              <p class="text-sm ${theme.subtle}">
+                Selecione VM e destino para ver compatibilidade e projeção em tempo real antes de confirmar.
+              </p>
+            </div>
+            <button
+              data-action="refresh-cluster"
+              data-cluster-id="${escapeHtml(clusterId)}"
+              class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+            >
+              <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+              Refresh
+            </button>
+          </div>
+
+          <div class="p-6 border-b ${theme.divider}">
+            <form id="move-vm-form" class="grid grid-cols-1 xl:grid-cols-4 gap-3">
+              <input type="hidden" name="clusterId" value="${escapeHtml(clusterId)}" />
+              <input type="hidden" name="sourceDatastoreId" value="${escapeHtml(datastoreId)}" />
+
+              <div class="xl:col-span-2">
+                <label class="mb-2 block text-sm font-semibold">VM</label>
+                <select
+                  name="vmId"
+                  class="w-full rounded-2xl border px-3 py-2 text-sm ${theme.input}"
+                  ${state.loading.vmMove || state.loading.datastoreVms ? "disabled" : ""}
+                >
+                  <option value="">Selecione uma VM</option>
+                  ${vms.map((vm) => `
+                    <option value="${escapeHtml(vm.vm_id)}" ${form.vmId === vm.vm_id ? "selected" : ""}>
+                      ${escapeHtml(vm.vm_name)} · ${formatGb(vm.size_gb)} · ${escapeHtml(vm.power_state || "unknown")}
+                    </option>
+                  `).join("")}
+                </select>
+              </div>
+
+              <div>
+                <label class="mb-2 block text-sm font-semibold">Destino</label>
+                <select
+                  name="targetDatastoreId"
+                  class="w-full rounded-2xl border px-3 py-2 text-sm ${theme.input}"
+                  ${state.loading.vmMove || !form.vmId ? "disabled" : ""}
+                >
+                  <option value="">Selecione destino</option>
+                  ${destinationOptions.map((item) => `
+                    <option
+                      value="${escapeHtml(item.datastore_id)}"
+                      ${form.targetDatastoreId === item.datastore_id ? "selected" : ""}
+                      ${item.compatible === false ? "disabled" : ""}
+                    >
+                      ${escapeHtml(item.datastore_name || item.datastore_id)}
+                      ${item.compatible === false ? " · incompatível" : ""}
+                      · used ${formatPct(item.current_used_pct)}
+                      ${item.projected_used_pct !== null && item.projected_used_pct !== undefined ? ` → ${formatPct(item.projected_used_pct)}` : ""}
+                    </option>
+                  `).join("")}
+                </select>
+              </div>
+
+              <div class="flex items-end">
+                <button
+                  type="submit"
+                  class="w-full inline-flex items-center justify-center rounded-2xl px-4 py-2 text-sm font-semibold text-white ${readOnly ? "bg-slate-400 cursor-not-allowed" : "bg-teal-600 hover:bg-teal-700"}"
+                  ${readOnly || state.loading.vmMove || !hasMoveSelection || !selectedTargetCompatible ? "disabled" : ""}
+                >
+                  ${state.loading.vmMove ? "Enfileirando..." : "Validar e confirmar move"}
+                </button>
+              </div>
+            </form>
+
+            ${
+              form.vmId && state.loading.moveOptions
+                ? `<div class="mt-4 skeleton h-12 rounded-2xl"></div>`
+                : ""
+            }
+
+            ${
+              form.vmId && moveOptions && moveOptions.reason === "ok"
+                ? `
+                  <div class="mt-4 text-xs ${theme.subtle}">
+                    Destinos compatíveis: ${formatNumber(moveTargets.filter((item) => item.compatible).length)} / ${formatNumber(moveTargets.length)}
+                  </div>
+                `
+                : ""
+            }
+
+            ${
+              form.vmId && selectedTargetOption && !selectedTargetCompatible
+                ? `
+                  <div class="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                    Destino incompatível:
+                    ${selectedTargetReasons.length ? selectedTargetReasons.map((item) => humanizeMoveReason(item)).join(" | ") : "restrições de capacidade"}
+                  </div>
+                `
+                : ""
+            }
+
+            ${
+              hasMoveSelection && activePreview
+                ? `
+                  <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="rounded-2xl border ${theme.rowBorder} p-4">
+                      <div class="text-xs ${theme.subtle} mb-1">Origem após saída da VM</div>
+                      <div class="font-semibold mb-2">${escapeHtml(activePreview.source.datastoreName)}</div>
+                      <div class="text-sm ${theme.subtle}">
+                        Free: ${formatGb(activePreview.source.currentFreeGb)} → ${formatGb(activePreview.source.projectedFreeGb)}
+                      </div>
+                      <div class="text-sm ${theme.subtle}">
+                        Used: ${formatPct(activePreview.source.currentUsedPct)} → ${formatPct(activePreview.source.projectedUsedPct)}
+                      </div>
+                    </div>
+                    <div class="rounded-2xl border ${theme.rowBorder} p-4">
+                      <div class="text-xs ${theme.subtle} mb-1">Destino após recebimento da VM</div>
+                      <div class="font-semibold mb-2">${escapeHtml(activePreview.target.datastoreName)}</div>
+                      <div class="text-sm ${theme.subtle}">
+                        Free: ${formatGb(activePreview.target.currentFreeGb)} → ${formatGb(activePreview.target.projectedFreeGb)}
+                      </div>
+                      <div class="text-sm ${theme.subtle}">
+                        Used: ${formatPct(activePreview.target.currentUsedPct)} → ${formatPct(activePreview.target.projectedUsedPct)}
+                      </div>
+                      <div class="mt-2">
+                        ${activePreview.target.compatible ? statusBadge("Destino compatível", "emerald") : statusBadge("Destino incompatível", "rose")}
+                      </div>
+                    </div>
+                  </div>
+                `
+                : ""
+            }
+
+            ${
+              state.moveTask.taskId
+                ? `
+                  <div class="mt-4 rounded-2xl border ${theme.rowBorder} p-4">
+                    <div class="flex items-center justify-between gap-3">
+                      <div>
+                        <div class="text-xs ${theme.subtle}">Task de migração</div>
+                        <div class="font-semibold">${escapeHtml(state.moveTask.taskId)}</div>
+                      </div>
+                      <div>
+                        ${
+                          state.moveTask.state.toLowerCase() === "success"
+                            ? statusBadge("Success", "emerald")
+                            : state.moveTask.state.toLowerCase() === "error"
+                              ? statusBadge("Error", "rose")
+                              : statusBadge("Running", "sky")
+                        }
+                      </div>
+                    </div>
+                    <div class="mt-2 text-sm ${theme.subtle}">
+                      Progress: ${state.moveTask.progress === null || state.moveTask.progress === undefined ? "—" : `${formatNumber(state.moveTask.progress)}%`}
+                    </div>
+                    ${
+                      state.moveTask.error
+                        ? `<div class="mt-2 text-sm text-rose-600">${escapeHtml(state.moveTask.error)}</div>`
+                        : ""
+                    }
+                  </div>
+                `
+                : ""
+            }
+          </div>
+        </section>
+
+        <section class="rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex items-center justify-between">
+            <div>
+              <h4 class="text-lg font-semibold">VMs deste datastore</h4>
+              <p class="text-sm ${theme.subtle}">Inventário atual de VMs e tamanho estimado</p>
+            </div>
+            ${state.loading.datastoreVms ? statusBadge("Loading", "sky") : statusBadge(`${formatNumber(vms.length)} VMs`, "teal")}
+          </div>
+
+          ${
+            !vms.length
+              ? `<div class="p-6">${emptyState("Sem VMs neste datastore", "Nenhuma VM foi retornada para este datastore no momento.")}</div>`
+              : `
+                <div class="overflow-x-auto thin-scrollbar">
+                  <table class="min-w-full">
+                    <thead class="${theme.tableHead}">
+                      <tr>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">VM</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Power</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Size</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Home DS</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${vms.map((vm) => `
+                        <tr class="border-t ${theme.rowBorder}">
+                          <td class="px-6 py-4">
+                            <div class="font-medium">${escapeHtml(vm.vm_name || "unknown")}</div>
+                            <div class="text-xs ${theme.subtle}">${escapeHtml(vm.vm_id || "")}</div>
+                          </td>
+                          <td class="px-6 py-4">${statusBadge(vm.power_state || "unknown", vm.power_state === "poweredOn" ? "emerald" : "slate")}</td>
+                          <td class="px-6 py-4">${formatGb(vm.size_gb)}</td>
+                          <td class="px-6 py-4">${escapeHtml(vm.home_datastore || "—")}</td>
+                        </tr>
+                      `).join("")}
+                    </tbody>
+                  </table>
+                </div>
+              `
+          }
+        </section>
+      `;
+    }
+
+    function renderRecommendations() {
+      const theme = getThemeClasses();
+      const readOnly = isReadOnlyMode();
+      const recommendationActionsAllowed = canManageRecommendations() && !readOnly;
+
+      if (state.loading.allRecommendations || state.loading.allCandidates) {
+        return `
+          <section class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            ${Array.from({ length: 6 }).map(() => `<div class="skeleton h-14 rounded-2xl mb-3"></div>`).join("")}
+          </section>
+        `;
+      }
+
+      if (!state.allRecommendations.length && !state.allCandidates.length) {
+        return `${errorBanner(state.errors.recommendations || state.errors.candidates)}${emptyState("Sem recomendações nem candidatos", "No momento não há recomendações pendentes do SDRS nem candidatos heurísticos relevantes.")}`;
+      }
+
+      return `
+        ${renderReadOnlyBanner()}
+        ${errorBanner(state.errors.recommendations || state.errors.candidates)}
+        <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <h3 class="text-lg font-semibold">SDRS Pending</h3>
+              <p class="text-sm ${theme.subtle}">Fila global de recomendações nativas do Storage DRS</p>
+            </div>
+            <button
+              data-action="refresh-recommendations"
+              class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+            >
+              <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+              Refresh
+            </button>
+          </div>
+
+          ${
+            !state.allRecommendations.length
+              ? `<div class="p-6">${emptyState("Sem SDRS pending", "Nenhuma recomendação pendente foi retornada pelo Storage DRS.")}</div>`
+              : `
+                <div class="overflow-x-auto thin-scrollbar">
+                  <table class="min-w-full">
+                    <thead class="${theme.tableHead}">
+                      <tr>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Type</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Reason</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Source DS → Target DS</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">VM</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Size</th>
+                        <th class="px-6 py-4 text-right text-xs font-semibold uppercase tracking-wide">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${state.allRecommendations.map((rec) => `
+                        <tr class="border-t ${theme.rowBorder}">
+                          <td class="px-6 py-4">${statusBadge(rec.type || "Recommendation", "violet")}</td>
+                          <td class="px-6 py-4">
+                            <div class="font-medium">${escapeHtml(rec.reason || "No reason provided")}</div>
+                            <div class="text-xs ${theme.subtle}">
+                              ${escapeHtml(rec.cluster_name || "Unknown cluster")}
+                            </div>
+                          </td>
+                          <td class="px-6 py-4">
+                            <div class="font-medium">${escapeHtml(rec.source_ds || "—")} → ${escapeHtml(rec.target_ds || "—")}</div>
+                          </td>
+                          <td class="px-6 py-4">${escapeHtml(rec.vm_name || "—")}</td>
+                          <td class="px-6 py-4">${formatGb(rec.size_gb)}</td>
+                          <td class="px-6 py-4">
+                            ${
+                              recommendationActionsAllowed
+                                ? `
+                                  <div class="flex justify-end gap-2">
+                                    <button
+                                      data-action="open-apply-modal"
+                                      data-cluster-id="${escapeHtml(rec.cluster_id)}"
+                                      data-key="${escapeHtml(rec.key)}"
+                                      data-title="Apply recommendation"
+                                      class="inline-flex items-center rounded-2xl px-3 py-2 text-sm font-semibold text-white bg-teal-600 hover:bg-teal-700"
+                                    >
+                                      Apply
+                                    </button>
+                                    <button
+                                      data-action="dismiss-recommendation"
+                                      data-cluster-id="${escapeHtml(rec.cluster_id)}"
+                                      data-key="${escapeHtml(rec.key)}"
+                                      class="inline-flex items-center rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+                                    >
+                                      Dismiss
+                                    </button>
+                                  </div>
+                                `
+                                : `<div class="flex justify-end">${statusBadge("Blocked by policy", "amber")}</div>`
+                            }
+                          </td>
+                        </tr>
+                      `).join("")}
+                    </tbody>
+                  </table>
+                </div>
+              `
+          }
+        </section>
+
+        <section class="rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
+          <div class="px-6 py-5 border-b ${theme.divider} flex items-center justify-between">
+            <div>
+              <h3 class="text-lg font-semibold">Heuristic Candidates (Read-only)</h3>
+              <p class="text-sm ${theme.subtle}">
+                Sugestões de movimento quando o SDRS não tem itens pendentes
+              </p>
+            </div>
+            ${statusBadge(`${state.allCandidates.length} candidates`, state.allCandidates.length ? "teal" : "slate")}
+          </div>
+
+          ${
+            !state.allCandidates.length
+              ? `<div class="p-6">${emptyState("Sem candidatos heurísticos", "Não há VMs com ganho claro de balanceamento para sugerir agora.")}</div>`
+              : `
+                <div class="overflow-x-auto thin-scrollbar">
+                  <table class="min-w-full">
+                    <thead class="${theme.tableHead}">
+                      <tr>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Cluster</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">VM</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Size</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Source → Target</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">After Move</th>
+                        <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Score</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      ${state.allCandidates.map((cand) => `
+                        <tr class="border-t ${theme.rowBorder}">
+                          <td class="px-6 py-4">
+                            <div class="font-medium">${escapeHtml(cand.cluster_name || "Unknown cluster")}</div>
+                            <div class="text-xs ${theme.subtle}">${escapeHtml(cand.cluster_id || "")}</div>
+                          </td>
+                          <td class="px-6 py-4">
+                            <div class="font-medium">${escapeHtml(cand.vm_name || "unknown")}</div>
+                            <div class="text-xs ${theme.subtle}">${escapeHtml(cand.vm_id || "")}</div>
+                          </td>
+                          <td class="px-6 py-4">${formatGb(cand.size_gb)}</td>
+                          <td class="px-6 py-4">
+                            <div class="font-medium">${escapeHtml(cand.source_ds || "—")} → ${escapeHtml(cand.target_ds || "—")}</div>
+                            <div class="text-xs ${theme.subtle}">
+                              ${formatPct(cand.source_used_pct)} → ${formatPct(cand.target_used_pct)}
+                            </div>
+                          </td>
+                          <td class="px-6 py-4">${formatPct(cand.source_used_after_pct)} → ${formatPct(cand.target_used_after_pct)}</td>
+                          <td class="px-6 py-4">
+                            ${statusBadge(formatNumber(cand.score || 0), Number(cand.score || 0) >= 70 ? "emerald" : "amber")}
+                          </td>
+                        </tr>
+                      `).join("")}
+                    </tbody>
+                  </table>
+                </div>
+              `
+          }
+        </section>
+      `;
+    }
+
+    function renderVcenter() {
+      const theme = getThemeClasses();
+      const safetyPolicy = getSafetyPolicy();
+      const deleteBlocked = safetyPolicy.forbid_vm_delete !== false;
+      const moveScope = (Array.isArray(safetyPolicy.allowed_write_operations) && safetyPolicy.allowed_write_operations.includes("vm_storage_relocate"))
+        ? "Somente move datastore"
+        : "Sem escrita";
+
+      return `
+        ${renderReadOnlyBanner()}
+        ${errorBanner(state.errors.vcenterConfig || state.connectionError)}
+        <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+          <div class="xl:col-span-2 rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <div class="mb-6 flex items-center justify-between gap-3">
+              <div>
+                <h3 class="text-lg font-semibold">vCenter configuration</h3>
+                <p class="text-sm ${theme.subtle}">Cadastro em runtime no backend para testes controlados</p>
+              </div>
+              ${state.loading.vcenterConfig ? statusBadge("Saving", "sky") : ""}
+            </div>
+
+            <form id="vcenter-form" class="space-y-5">
+              <div>
+                <label for="vcHost" class="mb-2 block text-sm font-semibold">Host</label>
+                <input
+                  id="vcHost"
+                  name="host"
+                  type="text"
+                  value="${escapeHtml(state.vcenterForm.host)}"
+                  class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                  placeholder="vcenter.example.local"
+                />
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label for="vcUser" class="mb-2 block text-sm font-semibold">Usuário</label>
+                  <input
+                    id="vcUser"
+                    name="user"
+                    type="text"
+                    value="${escapeHtml(state.vcenterForm.user)}"
+                    class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                    placeholder="administrator@vsphere.local"
+                  />
+                </div>
+
+                <div>
+                  <label for="vcPassword" class="mb-2 block text-sm font-semibold">Senha</label>
+                  <input
+                    id="vcPassword"
+                    name="password"
+                    type="password"
+                    value="${escapeHtml(state.vcenterForm.password)}"
+                    class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                    placeholder="••••••••"
+                  />
+                </div>
+              </div>
+
+              <label class="inline-flex items-center gap-2 text-sm">
+                <input
+                  id="vcVerifySsl"
+                  name="verify_ssl"
+                  type="checkbox"
+                  class="h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                  ${state.vcenterForm.verify_ssl ? "checked" : ""}
+                />
+                <span>Verificar certificado SSL</span>
+              </label>
+
+              <div class="flex flex-wrap gap-3">
+                <button
+                  type="submit"
+                  class="inline-flex items-center rounded-2xl bg-teal-600 px-4 py-3 text-sm font-semibold text-white hover:bg-teal-700"
+                >
+                  Salvar configuração
+                </button>
+                <button
+                  type="button"
+                  data-action="test-connection"
+                  class="inline-flex items-center rounded-2xl border px-4 py-3 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+                >
+                  Testar conexão
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <div class="mb-4">
+              <h3 class="text-lg font-semibold">Status</h3>
+              <p class="text-sm ${theme.subtle}">Estado atual para testes</p>
+            </div>
+            <div class="space-y-3 text-sm">
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Modo de escrita</span>
+                <span>${isReadOnlyMode() ? statusBadge("Read-only", "amber") : statusBadge("Writable", "emerald")}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Delete VM</span>
+                <span>${deleteBlocked ? statusBadge("Proibido", "rose") : statusBadge("Permitido", "amber")}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Escopo de escrita</span>
+                <span>${statusBadge(moveScope, "sky")}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Backend</span>
+                <span>${state.backendReachable ? statusBadge("Online", "emerald") : statusBadge("Offline", "rose")}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Conexão vCenter</span>
+                <span>${getConnectionBadge()}</span>
+              </div>
+              <div class="pt-2 text-xs ${theme.subtle}">
+                A configuração fica somente em memória do backend nesta fase.
+              </div>
+            </div>
+          </div>
+        </section>
+      `;
+    }
+
+    function renderSettings() {
+      const theme = getThemeClasses();
+      const safetyPolicy = getSafetyPolicy();
+      const deleteBlocked = safetyPolicy.forbid_vm_delete !== false;
+      const moveScope = (Array.isArray(safetyPolicy.allowed_write_operations) && safetyPolicy.allowed_write_operations.includes("vm_storage_relocate"))
+        ? "Somente move datastore"
+        : "Sem escrita";
+      return `
+        ${renderReadOnlyBanner()}
+        <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+          <div class="xl:col-span-2 rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <div class="mb-6">
+              <h3 class="text-lg font-semibold">Connection settings</h3>
+              <p class="text-sm ${theme.subtle}">Configuração em memória para a sessão atual da página</p>
+            </div>
+
+            <form id="settings-form" class="space-y-5">
+              <div>
+                <label for="apiBase" class="mb-2 block text-sm font-semibold">Backend API base URL</label>
+                <input
+                  id="apiBase"
+                  name="apiBase"
+                  type="text"
+                  value="${escapeHtml(state.apiBase)}"
+                  class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                  placeholder="http://localhost:8010"
+                />
+              </div>
+
+              <div class="flex flex-wrap gap-3">
+                <button
+                  type="submit"
+                  class="inline-flex items-center rounded-2xl bg-teal-600 px-4 py-3 text-sm font-semibold text-white hover:bg-teal-700"
+                >
+                  Save in memory
+                </button>
+
+                <button
+                  type="button"
+                  data-action="test-connection"
+                  class="inline-flex items-center rounded-2xl border px-4 py-3 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder}"
+                >
+                  Test vCenter connection
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+            <div class="mb-4">
+              <h3 class="text-lg font-semibold">Runtime status</h3>
+              <p class="text-sm ${theme.subtle}">Estado atual do frontend e do backend</p>
+            </div>
+
+            <div class="space-y-3 text-sm">
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Backend status</span>
+                <span>${state.backendReachable ? statusBadge("Online", "emerald") : statusBadge("Offline", "rose")}</span>
+              </div>
+
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Delete VM</span>
+                <span>${deleteBlocked ? statusBadge("Proibido", "rose") : statusBadge("Permitido", "amber")}</span>
+              </div>
+
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Escopo de escrita</span>
+                <span>${statusBadge(moveScope, "sky")}</span>
+              </div>
+
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">vCenter connection</span>
+                <span>${getConnectionBadge()}</span>
+              </div>
+
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Configured host</span>
+                <span class="font-semibold">${escapeHtml(state.health?.vcenter || "—")}</span>
+              </div>
+
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Main theme</span>
+                <span class="font-semibold capitalize">${escapeHtml(state.theme)}</span>
+              </div>
+            </div>
+          </div>
+        </section>
+      `;
+    }
+
+    function renderContent() {
+      switch (state.route.name) {
+        case "clusters":
+          return renderClusters();
+        case "cluster":
+          return renderClusterDetail();
+        case "datastore":
+          return renderDatastoreDetail();
+        case "recommendations":
+          return renderRecommendations();
+        case "vcenter":
+          return renderVcenter();
+        case "settings":
+          return renderSettings();
+        case "dashboard":
+        default:
+          return renderDashboard();
+      }
+    }
+
+    function renderTopbarTitle() {
+      if (state.route.name === "clusters") return { label: "Inventory", title: "Clusters" };
+      if (state.route.name === "cluster") {
+        const detail = state.clusterDetails[state.route.clusterId];
+        return { label: "Cluster Detail", title: detail?.name || "Cluster" };
+      }
+      if (state.route.name === "datastore") {
+        const ds = findDatastoreById(state.route.clusterId, state.route.datastoreId);
+        return { label: "Datastore Detail", title: ds?.name || "Datastore" };
+      }
+      if (state.route.name === "recommendations") return { label: "Operations", title: "Recommendations" };
+      if (state.route.name === "vcenter") return { label: "Configuration", title: "vCenter" };
+      if (state.route.name === "settings") return { label: "Configuration", title: "Settings" };
+      return { label: "Overview", title: "Dashboard" };
+    }
+
+    function renderToast() {
+      if (!state.toast.visible) return "";
+
+      const tones = {
+        info: "border-sky-200 bg-sky-50 text-sky-700",
+        success: "border-emerald-200 bg-emerald-50 text-emerald-700",
+        error: "border-rose-200 bg-rose-50 text-rose-700"
+      };
+
+      return `
+        <div class="fixed bottom-5 right-5 z-[70] max-w-sm rounded-2xl border px-4 py-3 text-sm font-medium shadow-soft ${tones[state.toast.type] || tones.info}">
+          ${escapeHtml(state.toast.message)}
+        </div>
+      `;
+    }
+
+    function renderModal() {
+      if (!state.modal.open) return "";
+
+      return `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-slate-950/60" data-action="close-modal"></div>
+          <div class="relative z-10 w-full max-w-lg rounded-3xl border border-slate-200 bg-white p-6 shadow-soft">
+            <div class="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <h3 class="text-xl font-bold text-slate-900">${escapeHtml(state.modal.title)}</h3>
+                <p class="mt-2 text-sm text-slate-500">${escapeHtml(state.modal.body)}</p>
+              </div>
+              <button
+                data-action="close-modal"
+                class="rounded-2xl border border-slate-200 p-2 text-slate-500 hover:bg-slate-50"
+              >
+                <i data-lucide="x" class="w-4 h-4"></i>
+              </button>
+            </div>
+
+            <div class="mb-6 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+              <div><span class="font-semibold">Cluster:</span> ${escapeHtml(state.modal.clusterId)}</div>
+              <div class="mt-1"><span class="font-semibold">Recommendation key:</span> ${escapeHtml(state.modal.key)}</div>
+            </div>
+
+            <div class="flex justify-end gap-3">
+              <button
+                data-action="close-modal"
+                class="rounded-2xl border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                data-action="confirm-apply"
+                class="rounded-2xl bg-teal-600 px-4 py-3 text-sm font-semibold text-white hover:bg-teal-700"
+              >
+                Confirm Apply
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderMoveConfirmModal() {
+      if (!state.moveConfirm.open) return "";
+      const preview = state.movePreview;
+
+      return `
+        <div class="fixed inset-0 z-[65] flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-slate-950/60" data-action="close-move-confirm-modal"></div>
+          <div class="relative z-10 w-full max-w-2xl rounded-3xl border border-slate-200 bg-white p-6 shadow-soft">
+            <div class="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <h3 class="text-xl font-bold text-slate-900">Confirmar migração manual</h3>
+                <p class="mt-2 text-sm text-slate-500">
+                  Revise a projeção de espaço antes de enfileirar a task de Storage vMotion.
+                </p>
+              </div>
+              <button
+                data-action="close-move-confirm-modal"
+                class="rounded-2xl border border-slate-200 p-2 text-slate-500 hover:bg-slate-50"
+              >
+                <i data-lucide="x" class="w-4 h-4"></i>
+              </button>
+            </div>
+
+            <div class="mb-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+              <div><span class="font-semibold">VM:</span> ${escapeHtml(state.moveConfirm.vmName)} (${escapeHtml(state.moveConfirm.vmId)})</div>
+              <div class="mt-1"><span class="font-semibold">Tamanho estimado:</span> ${formatGb(state.moveConfirm.sizeGb)}</div>
+              <div class="mt-1"><span class="font-semibold">Origem:</span> ${escapeHtml(state.moveConfirm.sourceDatastoreName)}</div>
+              <div class="mt-1"><span class="font-semibold">Destino:</span> ${escapeHtml(state.moveConfirm.targetDatastoreName)}</div>
+            </div>
+
+            ${
+              preview
+                ? `
+                  <div class="mb-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="rounded-2xl border border-slate-200 p-4">
+                      <div class="text-xs text-slate-500 mb-1">Origem (após move)</div>
+                      <div class="font-semibold mb-2">${escapeHtml(preview.source.datastoreName)}</div>
+                      <div class="text-sm text-slate-600">Free: ${formatGb(preview.source.currentFreeGb)} → ${formatGb(preview.source.projectedFreeGb)}</div>
+                      <div class="text-sm text-slate-600">Used: ${formatPct(preview.source.currentUsedPct)} → ${formatPct(preview.source.projectedUsedPct)}</div>
+                    </div>
+                    <div class="rounded-2xl border border-slate-200 p-4">
+                      <div class="text-xs text-slate-500 mb-1">Destino (após move)</div>
+                      <div class="font-semibold mb-2">${escapeHtml(preview.target.datastoreName)}</div>
+                      <div class="text-sm text-slate-600">Free: ${formatGb(preview.target.currentFreeGb)} → ${formatGb(preview.target.projectedFreeGb)}</div>
+                      <div class="text-sm text-slate-600">Used: ${formatPct(preview.target.currentUsedPct)} → ${formatPct(preview.target.projectedUsedPct)}</div>
+                    </div>
+                  </div>
+                `
+                : ""
+            }
+
+            <div class="flex justify-end gap-3">
+              <button
+                data-action="close-move-confirm-modal"
+                class="rounded-2xl border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Cancelar
+              </button>
+              <button
+                data-action="confirm-vm-move"
+                class="rounded-2xl bg-teal-600 px-4 py-3 text-sm font-semibold text-white hover:bg-teal-700"
+                ${state.loading.vmMove ? "disabled" : ""}
+              >
+                Confirmar e enfileirar
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function render() {
+      const theme = getThemeClasses();
+      const top = renderTopbarTitle();
+
+      document.documentElement.classList.toggle("dark", state.theme === "dark");
+
+      const sidebar = `
+        <aside class="fixed inset-y-0 left-0 z-40 w-72 transform bg-slate-950 text-slate-100 transition duration-200 ${
+          state.sidebarOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"
+        }">
+          <div class="flex h-full flex-col">
+            <div class="border-b border-slate-800 px-6 py-6">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                  <div class="flex h-10 w-10 items-center justify-center rounded-2xl bg-teal-500/20 text-teal-300">
+                    <i data-lucide="database"></i>
+                  </div>
+                  <div>
+                    <h1 class="text-lg font-semibold tracking-tight">SDRS Manager</h1>
+                    <p class="text-xs text-slate-400">VMware Storage DRS Dashboard</p>
+                  </div>
+                </div>
+
+                <button
+                  data-action="toggle-sidebar"
+                  class="rounded-2xl p-2 text-slate-400 hover:bg-slate-900 lg:hidden"
+                >
+                  <i data-lucide="x" class="w-4 h-4"></i>
+                </button>
+              </div>
+            </div>
+
+            <nav class="space-y-2 px-4 py-6">
+              ${navItem("dashboard", "layout-dashboard", "Dashboard", "#dashboard")}
+              ${navItem("clusters", "folders", "Clusters", "#clusters")}
+              ${navItem("recommendations", "arrow-right-left", "Recommendations", "#recommendations")}
+              ${navItem("vcenter", "server-cog", "vCenter", "#vcenter")}
+              ${navItem("settings", "settings", "Settings", "#settings")}
+            </nav>
+
+            <div class="mt-auto p-4">
+              <div class="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+                <div class="mb-3 flex items-center justify-between">
+                  <p class="text-xs uppercase tracking-wide text-slate-500">Connection</p>
+                  ${getConnectionBadge()}
+                </div>
+
+                <div class="text-sm text-slate-300">
+                  <div class="mb-1 font-semibold">${escapeHtml(state.health?.vcenter || "Host not loaded")}</div>
+                  <p class="text-xs text-slate-400">
+                    Backend API: ${escapeHtml(state.apiBase)}
+                  </p>
+                  <p class="mt-2 text-xs text-slate-400">
+                    Política fixa: exclusão de VM bloqueada. Escopo operacional: move entre datastores.
+                  </p>
+                </div>
+
+                <button
+                  data-action="test-connection"
+                  class="mt-4 inline-flex w-full items-center justify-center rounded-2xl bg-teal-600 px-3 py-2 text-sm font-semibold text-white hover:bg-teal-700"
+                >
+                  Test connection
+                </button>
+              </div>
+            </div>
+          </div>
+        </aside>
+      `;
+
+      const overlay = state.sidebarOpen
+        ? `<div data-action="toggle-sidebar" class="fixed inset-0 z-30 bg-slate-950/50 lg:hidden"></div>`
+        : "";
+
+      document.getElementById("app").innerHTML = `
+        <div class="min-h-screen">
+          ${overlay}
+          ${sidebar}
+
+          <div class="lg:ml-72">
+            <main class="min-h-screen ${theme.shell}">
+              <div class="px-4 py-4 sm:px-6 lg:px-8 lg:py-8">
+                <header class="mb-8 flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+                  <div class="flex items-start gap-3">
+                    <button
+                      data-action="toggle-sidebar"
+                      class="mt-1 rounded-2xl border border-slate-200 bg-white p-2 text-slate-700 shadow-soft lg:hidden"
+                    >
+                      <i data-lucide="menu" class="w-4 h-4"></i>
+                    </button>
+                    <div>
+                      <p class="text-sm ${theme.subtle}">${escapeHtml(top.label)}</p>
+                      <h2 class="text-3xl font-bold tracking-tight">${escapeHtml(top.title)}</h2>
+                    </div>
+                  </div>
+
+                  <div class="flex flex-wrap items-center gap-3">
+                    <div class="rounded-2xl border px-4 py-3 shadow-soft ${theme.panel}">
+                      <p class="text-xs ${theme.subtle}">vCenter Host</p>
+                      <p class="text-sm font-semibold">${escapeHtml(state.health?.vcenter || "Not configured")}</p>
+                    </div>
+
+                    <button
+                      data-action="toggle-theme"
+                      class="inline-flex items-center gap-2 rounded-2xl border px-4 py-3 text-sm font-semibold shadow-soft ${theme.panel}"
+                    >
+                      <i data-lucide="${state.theme === "dark" ? "sun-medium" : "moon-star"}" class="w-4 h-4"></i>
+                      ${state.theme === "dark" ? "Light main area" : "Dark main area"}
+                    </button>
+                  </div>
+                </header>
+
+                ${renderContent()}
+              </div>
+            </main>
+          </div>
+        </div>
+
+        ${renderModal()}
+        ${renderMoveConfirmModal()}
+        ${renderToast()}
+      `;
+
+      lucide.createIcons();
+    }
+
+    async function refreshDashboard() {
+      state.clustersLoaded = false;
+      state.allRecommendations = [];
+      state.allCandidates = [];
+      await Promise.all([
+        loadHealth(true),
+        connectVcenter(false),
+        loadClusters(true)
+      ]);
+      await Promise.all([loadAllRecommendations(true), loadAllCandidates(true)]);
+    }
+
+    async function ensureDataForCurrentRoute() {
+      const route = state.route;
+
+      await loadHealth();
+
+      if (route.name === "dashboard") {
+        await Promise.all([loadClusters(), loadAllRecommendations(), loadAllCandidates()]);
+        return;
+      }
+
+      if (route.name === "clusters") {
+        await loadClusters();
+        warmClusterDetailsForTable();
+        return;
+      }
+
+      if (route.name === "cluster") {
+        await loadClusters();
+        await Promise.all([
+          loadClusterDetail(route.clusterId),
+          loadClusterRecommendations(route.clusterId),
+          loadClusterCandidates(route.clusterId),
+          loadClusterSimulation(route.clusterId)
+        ]);
+        return;
+      }
+
+      if (route.name === "datastore") {
+        await loadClusters();
+        await loadClusterDetail(route.clusterId);
+        const ds = findDatastoreById(route.clusterId, route.datastoreId);
+        await openDatastoreVms(route.clusterId, route.datastoreId, ds?.name || route.datastoreId);
+        return;
+      }
+
+      if (route.name === "recommendations") {
+        await Promise.all([loadAllRecommendations(), loadAllCandidates()]);
+        return;
+      }
+
+      if (route.name === "vcenter") {
+        await loadVcenterConfig();
+        return;
+      }
+
+      if (route.name === "settings") {
+        return;
+      }
+    }
+
+    async function onRouteChange() {
+      state.route = parseRoute();
+      state.sidebarOpen = false;
+      render();
+      await ensureDataForCurrentRoute();
+    }
+
+    document.addEventListener("click", async (event) => {
+      const trigger = event.target.closest("[data-action]");
+      if (!trigger) return;
+
+      const action = trigger.dataset.action;
+
+      if (action === "toggle-sidebar") {
+        state.sidebarOpen = !state.sidebarOpen;
+        render();
+        return;
+      }
+
+      if (action === "toggle-theme") {
+        state.theme = state.theme === "dark" ? "light" : "dark";
+        render();
+        return;
+      }
+
+      if (action === "test-connection") {
+        await Promise.all([loadHealth(true), connectVcenter(true)]);
+        return;
+      }
+
+      if (action === "refresh-dashboard") {
+        await refreshDashboard();
+        return;
+      }
+
+      if (action === "refresh-clusters") {
+        state.clustersLoaded = false;
+        await loadClusters(true);
+        await warmClusterDetailsForTable();
+        return;
+      }
+
+      if (action === "refresh-recommendations") {
+        state.allRecommendations = [];
+        state.allCandidates = [];
+        await Promise.all([loadAllRecommendations(true), loadAllCandidates(true)]);
+        return;
+      }
+
+      if (action === "refresh-cluster") {
+        const clusterId = trigger.dataset.clusterId;
+        if (!clusterId) return;
+        delete state.clusterDetails[clusterId];
+        delete state.clusterRecs[clusterId];
+        delete state.clusterCandidates[clusterId];
+        delete state.clusterSimulation[clusterId];
+        if (state.selectedDatastore.clusterId === clusterId && state.selectedDatastore.datastoreId) {
+          delete state.datastoreVms[datastoreKey(clusterId, state.selectedDatastore.datastoreId)];
+          state.movePreview = null;
+          state.moveConfirm.open = false;
+          state.moveForm = {
+            clusterId,
+            sourceDatastoreId: state.selectedDatastore.datastoreId,
+            vmId: "",
+            targetDatastoreId: ""
+          };
+        }
+        await Promise.all([
+          loadClusterDetail(clusterId, true),
+          loadClusterRecommendations(clusterId, true),
+          loadClusterCandidates(clusterId, true),
+          loadClusterSimulation(clusterId, true)
+        ]);
+        if (state.route.name === "datastore" && state.route.clusterId === clusterId && state.route.datastoreId) {
+          const ds = findDatastoreById(clusterId, state.route.datastoreId);
+          await openDatastoreVms(clusterId, state.route.datastoreId, ds?.name || state.route.datastoreId);
+        }
+        return;
+      }
+
+      if (action === "refresh-cluster-simulation") {
+        const clusterId = trigger.dataset.clusterId;
+        if (!clusterId) return;
+        delete state.clusterSimulation[clusterId];
+        await loadClusterSimulation(clusterId, true);
+        return;
+      }
+
+      if (action === "view-cluster") {
+        const clusterId = trigger.dataset.clusterId;
+        if (!clusterId) return;
+        setHash(`#cluster/${encodeURIComponent(clusterId)}`);
+        return;
+      }
+
+      if (action === "open-datastore-vms") {
+        const clusterId = trigger.dataset.clusterId;
+        const datastoreId = trigger.dataset.datastoreId;
+        const datastoreName = trigger.dataset.datastoreName || datastoreId;
+        if (!clusterId || !datastoreId) return;
+        await openDatastoreVms(clusterId, datastoreId, datastoreName);
+        return;
+      }
+
+      if (action === "view-datastore-page") {
+        const clusterId = trigger.dataset.clusterId;
+        const datastoreId = trigger.dataset.datastoreId;
+        if (!clusterId || !datastoreId) return;
+        setHash(`#cluster/${encodeURIComponent(clusterId)}/datastore/${encodeURIComponent(datastoreId)}`);
+        return;
+      }
+
+      if (action === "open-apply-modal") {
+        openApplyModal(
+          trigger.dataset.clusterId,
+          trigger.dataset.key,
+          trigger.dataset.title || "Confirm apply"
+        );
+        return;
+      }
+
+      if (action === "close-move-confirm-modal") {
+        closeMoveConfirmModal();
+        return;
+      }
+
+      if (action === "confirm-vm-move") {
+        const payload = state.moveConfirm;
+        if (!payload.clusterId || !payload.vmId || !payload.targetDatastoreId) return;
+        await moveVmToDatastore(
+          payload.clusterId,
+          payload.vmId,
+          payload.sourceDatastoreId,
+          payload.targetDatastoreId
+        );
+        return;
+      }
+
+      if (action === "close-modal") {
+        closeModal();
+        return;
+      }
+
+      if (action === "confirm-apply") {
+        if (!state.modal.clusterId || !state.modal.key) return;
+        await applyRecommendation(state.modal.clusterId, state.modal.key);
+        return;
+      }
+
+      if (action === "dismiss-recommendation") {
+        const clusterId = trigger.dataset.clusterId;
+        const key = trigger.dataset.key;
+        if (!clusterId || !key) return;
+        await dismissRecommendation(clusterId, key);
+        return;
+      }
+    });
+
+    document.addEventListener("change", async (event) => {
+      const form = event.target.closest("form");
+      if (!form || form.id !== "move-vm-form") return;
+
+      const formData = new FormData(form);
+      const clusterId = String(formData.get("clusterId") || "").trim();
+      const sourceDatastoreId = String(formData.get("sourceDatastoreId") || "").trim();
+      const vmId = String(formData.get("vmId") || "").trim();
+      let targetDatastoreId = String(formData.get("targetDatastoreId") || "").trim();
+
+      if (event.target.name === "vmId") {
+        targetDatastoreId = "";
+      }
+
+      state.moveForm = {
+        clusterId,
+        sourceDatastoreId,
+        vmId,
+        targetDatastoreId
+      };
+
+      if (event.target.name === "vmId") {
+        state.movePreview = null;
+        state.moveConfirm.open = false;
+        if (vmId) {
+          await loadMoveOptions(clusterId, sourceDatastoreId, vmId, true);
+        }
+      }
+
+      if (state.moveForm.vmId && state.moveForm.targetDatastoreId) {
+        state.movePreview = buildMovePreview(
+          state.moveForm.clusterId,
+          state.moveForm.sourceDatastoreId,
+          state.moveForm.targetDatastoreId,
+          state.moveForm.vmId
+        );
+      } else if (event.target.name === "targetDatastoreId") {
+        state.movePreview = null;
+      }
+
+      render();
+    });
+
+    document.addEventListener("submit", async (event) => {
+      const form = event.target;
+      if (!(form.id === "settings-form" || form.id === "vcenter-form" || form.id === "move-vm-form")) return;
+
+      event.preventDefault();
+
+      if (form.id === "settings-form") {
+        const formData = new FormData(form);
+        const apiBase = String(formData.get("apiBase") || "").trim();
+
+        if (!apiBase) {
+          showToast("Informe a URL base do backend.", "error");
+          return;
+        }
+
+        state.apiBase = apiBase.replace(/\/+$/, "");
+        state.health = null;
+        state.backendReachable = false;
+        state.connected = false;
+        state.connectionError = "";
+        state.clusters = [];
+        state.clustersLoaded = false;
+        state.clusterDetails = {};
+        state.clusterRecs = {};
+        state.clusterCandidates = {};
+        state.clusterSimulation = {};
+        state.datastoreVms = {};
+        state.allRecommendations = [];
+        state.allCandidates = [];
+        state.selectedDatastore = { clusterId: "", datastoreId: "", datastoreName: "" };
+        state.moveForm = { clusterId: "", sourceDatastoreId: "", vmId: "", targetDatastoreId: "" };
+        state.moveOptionsByVm = {};
+        state.movePreview = null;
+        state.moveConfirm.open = false;
+        stopMoveTaskPolling();
+        state.moveTask = { taskId: "", state: "", progress: null, error: "", active: false };
+        showToast("URL do backend atualizada só nesta sessão.", "success");
+        render();
+
+        await Promise.all([loadHealth(true), connectVcenter(false)]);
+        return;
+      }
+
+      if (form.id === "vcenter-form") {
+        const formData = new FormData(form);
+        state.vcenterForm.host = String(formData.get("host") || "").trim();
+        state.vcenterForm.user = String(formData.get("user") || "").trim();
+        state.vcenterForm.password = String(formData.get("password") || "");
+        state.vcenterForm.verify_ssl = formData.get("verify_ssl") === "on";
+
+        await saveVcenterConfig(true);
+        await connectVcenter(true);
+        return;
+      }
+
+      if (form.id === "move-vm-form") {
+        const formData = new FormData(form);
+        const clusterId = String(formData.get("clusterId") || "").trim();
+        const sourceDatastoreId = String(formData.get("sourceDatastoreId") || "").trim();
+        const vmId = String(formData.get("vmId") || "").trim();
+        const targetDatastoreId = String(formData.get("targetDatastoreId") || "").trim();
+
+        state.moveForm = {
+          clusterId,
+          sourceDatastoreId,
+          vmId,
+          targetDatastoreId
+        };
+        state.movePreview = buildMovePreview(clusterId, sourceDatastoreId, targetDatastoreId, vmId);
+        openMoveConfirmModal();
+      }
+    });
+
+    window.addEventListener("hashchange", onRouteChange);
+
+    async function init() {
+      state.route = parseRoute();
+      render();
+      await Promise.all([loadHealth(true), loadVcenterConfig(true)]);
+      await connectVcenter(false);
+      await ensureDataForCurrentRoute();
+    }
+
+    init();
+  </script>
+</body>
+</html>
