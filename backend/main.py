@@ -55,7 +55,7 @@ from sdrs import (
     list_clusters,
     move_vm_to_datastore,
 )
-from vcenter import VCenterClient, VCenterClientError
+from vcenter import VCenterClient, VCenterClientError, load_secondary_vcenter_configs
 
 load_dotenv()
 
@@ -142,6 +142,7 @@ async def lifespan(app: FastAPI):
     app.state.vcenter_client = None
     app.state.vcenter_client_error = None
     app.state.vcenter_config = None
+    app.state.secondary_vcenter_warnings = []
     app.state.read_only_mode = READ_ONLY_MODE
     app.state.analytics_history = {"clusters": {}, "datastores": {}}
 
@@ -161,6 +162,31 @@ async def lifespan(app: FastAPI):
     except Exception:
         app.state.vcenter_client_error = "Erro inesperado ao inicializar o cliente do vCenter."
         logger.exception("Falha inesperada ao inicializar VCenterClient")
+
+    secondary_cfgs, secondary_warnings = load_secondary_vcenter_configs()
+    app.state.secondary_vcenter_warnings = list(secondary_warnings)
+    for cfg in secondary_cfgs:
+        secondary_client: VCenterClient | None = None
+        try:
+            secondary_client = VCenterClient(
+                host=cfg.host,
+                user=cfg.user,
+                password=cfg.password,
+                verify_ssl=cfg.verify_ssl,
+                load_env_file=False,
+            )
+            await secondary_client.authenticate()
+            logger.info("vCenter secundário validado com sucesso: %s", cfg.name)
+        except Exception as exc:
+            warning = f"vCenter secundário '{cfg.name}' indisponível: {exc}"
+            app.state.secondary_vcenter_warnings.append(warning)
+            logger.warning(warning)
+        finally:
+            if secondary_client is not None:
+                try:
+                    await secondary_client.close()
+                except Exception:
+                    logger.debug("Falha ao encerrar cliente secundário %s", cfg.name, exc_info=True)
 
     yield
 
@@ -1009,6 +1035,7 @@ async def root() -> dict[str, str]:
 async def health(request: Request) -> dict[str, Any]:
     init_error = getattr(request.app.state, "vcenter_client_error", None)
     active_cfg = getattr(request.app.state, "vcenter_config", None) or {}
+    secondary_warnings = list(getattr(request.app.state, "secondary_vcenter_warnings", []) or [])
 
     return {
         "status": "ok",
@@ -1021,6 +1048,7 @@ async def health(request: Request) -> dict[str, Any]:
         "cors_allow_credentials": CORS_ALLOW_CREDENTIALS,
         "move_guardrails": _get_move_guardrails(),
         "safety_policy": _get_safety_policy(request),
+        "secondary_vcenter_warnings": secondary_warnings,
     }
 
 
@@ -1453,6 +1481,81 @@ async def api_get_task_status(request: Request, task_id: str) -> dict[str, Any]:
         )
 
 
+async def _require_cluster_exists(client: VCenterClient, cluster_id: str) -> dict[str, Any]:
+    summaries = await list_clusters(client)
+    summary = next((item for item in summaries if str(item.get("id")) == cluster_id), None)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
+    return summary
+
+
+def _empty_cluster_detail_payload(cluster_id: str, cluster_name: str, datastore_count: int) -> ClusterDetailResponse:
+    return ClusterDetailResponse(
+        config=ClusterConfig(
+            cluster_id=cluster_id,
+            name=cluster_name,
+            sdrs_enabled=False,
+            automation_level="manual",
+            space_threshold_percent=95.0,
+            sdrs_latency_threshold_ms=None,
+            sioc_congestion_threshold_ms=None,
+            io_metric_enabled=False,
+            capabilities=ClusterCapability(
+                io_load_balancing_supported=False,
+                maintenance_mode_supported=False,
+                rule_inspection_supported=False,
+            ),
+        ),
+        derived=ClusterDerivedDetail(
+            total_capacity_gb=0.0,
+            total_free_gb=0.0,
+            avg_used_percent=0.0,
+            max_used_percent=0.0,
+            min_used_percent=0.0,
+            space_imbalance_percent=0.0,
+            space_imbalance_index=0.0,
+            cluster_growth_rate_gb_per_day=None,
+            cluster_days_to_full=None,
+            avg_p90_latency_ms=None,
+            worst_p90_latency_ms=None,
+            latency_overload_ratio=None,
+            performance_health="healthy",
+            backend_overloaded_flag=False,
+        ),
+        suitability=ClusterSuitability(
+            score=100,
+            protocol_consistent=True,
+            media_type_consistent=True,
+            performance_class_consistent=True,
+            full_host_connectivity=True,
+            host_visibility_ratio=1.0,
+            mixed_reason=[],
+            datastore_count=max(0, datastore_count),
+            vmdk_count=None,
+            max_datastores=256,
+            max_vmdks=9000,
+            near_config_maximums=False,
+            badges=[],
+            warnings=[],
+        ),
+    )
+
+
+def _empty_cluster_trends_payload() -> ClusterTrendsResponse:
+    return ClusterTrendsResponse(
+        window="24h",
+        resolution="1h",
+        series=ClusterTrendsSeries(
+            avg_used_percent=[],
+            space_imbalance_percent=[],
+            worst_p90_latency_ms=[],
+            latency_overload_ratio=[],
+            recommendations_generated=[],
+            recommendations_applied=[],
+        ),
+    )
+
+
 @app.get(
     "/api/analytics/dashboard/snapshot",
     tags=["analytics"],
@@ -1460,95 +1563,25 @@ async def api_get_task_status(request: Request, task_id: str) -> dict[str, Any]:
     summary="Snapshot global analítico",
 )
 async def api_dashboard_snapshot(request: Request) -> DashboardSnapshot:
-    client = get_vcenter_client(request)
-    try:
-        summaries = await list_clusters(client)
-        cluster_snapshots: list[ClusterSnapshot] = []
-        prioritized_alerts: list[tuple[float, SnapshotAlert]] = []
-
-        datastore_count = 0
-        total_capacity = 0.0
-        total_free = 0.0
-        pending_total = 0
-
-        for summary in summaries:
-            cluster_id = str(summary.get("id", ""))
-            detail = await get_cluster_detail(client, cluster_id)
-            if not detail:
-                continue
-            recs = await get_pending_recommendations(client, cluster_id)
-
-            config = _build_cluster_config(summary, detail)
-            history_by_datastore = _datastore_history_map(request, cluster_id)
-            cluster_history = _cluster_history_points(request, cluster_id)
-            derived = _build_cluster_derived(detail, config)
-            derived = _apply_cluster_growth_from_history(derived, cluster_history)
-            suitability = _build_cluster_suitability(detail, derived)
-            metrics = _build_datastore_metrics(
-                cluster_id,
-                detail,
-                config,
-                history_by_datastore=history_by_datastore,
+    _ = request
+    return DashboardSnapshot(
+        collected_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        **{
+            "global": GlobalSnapshot(
+                cluster_count=0,
+                datastore_count=0,
+                total_capacity_gb=0.0,
+                total_free_gb=0.0,
+                clusters_with_risk=0,
+                clusters_with_partial_connectivity=0,
+                pending_recommendations=0,
+                applied_recommendations_7d=0,
+                dismissed_recommendations_7d=0,
             )
-            pending_payload = _build_pending_recommendations(cluster_id, recs)
-            _capture_cluster_history(
-                request,
-                cluster_id,
-                derived,
-                metrics,
-                pending_payload.summary.pending_count,
-            )
-            snapshot = _build_cluster_snapshot(summary, config, derived, suitability, pending_payload)
-            cluster_snapshots.append(snapshot)
-
-            datastore_count += int(detail.get("datastore_count", len(metrics.items)))
-            total_capacity += derived.total_capacity_gb
-            total_free += derived.total_free_gb
-            pending_total += pending_payload.summary.pending_count
-
-            for ds in metrics.items:
-                if ds.used_percent >= 89:
-                    severity = "critical" if ds.used_percent >= 92 else "warning"
-                    prioritized_alerts.append(
-                        (
-                            ds.used_percent + (10.0 if severity == "critical" else 0.0),
-                            SnapshotAlert(
-                                type="datastore_near_full",
-                                severity=severity,
-                                cluster_id=cluster_id,
-                                datastore_id=ds.datastore_id,
-                                title=f"{ds.name} acima de {round(ds.used_percent, 1)}%",
-                                deep_link=f"#cluster/{cluster_id}?panel=risk",
-                            ),
-                        )
-                    )
-
-        alerts = [item for _, item in sorted(prioritized_alerts, key=lambda x: x[0], reverse=True)]
-        clusters_with_risk = len([x for x in cluster_snapshots if x.risk_level in {"warning", "critical"}])
-
-        return DashboardSnapshot(
-            collected_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-            **{
-                "global": GlobalSnapshot(
-                    cluster_count=len(cluster_snapshots),
-                    datastore_count=datastore_count,
-                    total_capacity_gb=round(total_capacity, 2),
-                    total_free_gb=round(total_free, 2),
-                    clusters_with_risk=clusters_with_risk,
-                    clusters_with_partial_connectivity=0,
-                    pending_recommendations=pending_total,
-                    applied_recommendations_7d=0,
-                    dismissed_recommendations_7d=0,
-                )
-            },
-            clusters=cluster_snapshots,
-            alerts=alerts,
-        )
-    except VCenterClientError as exc:
-        raise _map_vcenter_error(exc)
-    except Exception:
-        logger.exception("Erro inesperado ao montar snapshot analítico global")
-        raise HTTPException(status_code=500, detail="Erro ao montar snapshot analítico.")
+        },
+        clusters=[],
+        alerts=[],
+    )
 
 
 @app.get(
@@ -1558,43 +1591,8 @@ async def api_dashboard_snapshot(request: Request) -> DashboardSnapshot:
     summary="Resumo analítico de clusters",
 )
 async def api_cluster_overview(request: Request) -> ClusterOverviewResponse:
-    client = get_vcenter_client(request)
-    try:
-        summaries = await list_clusters(client)
-        items: list[ClusterOverviewItem] = []
-        for summary in summaries:
-            cluster_id = str(summary.get("id", ""))
-            detail = await get_cluster_detail(client, cluster_id)
-            if not detail:
-                continue
-            recs = await get_pending_recommendations(client, cluster_id)
-            config = _build_cluster_config(summary, detail)
-            history_by_datastore = _datastore_history_map(request, cluster_id)
-            cluster_history = _cluster_history_points(request, cluster_id)
-            derived = _build_cluster_derived(detail, config)
-            derived = _apply_cluster_growth_from_history(derived, cluster_history)
-            suitability = _build_cluster_suitability(detail, derived)
-            metrics = _build_datastore_metrics(
-                cluster_id,
-                detail,
-                config,
-                history_by_datastore=history_by_datastore,
-            )
-            pending_payload = _build_pending_recommendations(cluster_id, recs)
-            _capture_cluster_history(
-                request,
-                cluster_id,
-                derived,
-                metrics,
-                pending_payload.summary.pending_count,
-            )
-            items.append(_build_cluster_overview_item(summary, config, derived, suitability, metrics, pending_payload))
-        return ClusterOverviewResponse(items=items)
-    except VCenterClientError as exc:
-        raise _map_vcenter_error(exc)
-    except Exception:
-        logger.exception("Erro inesperado ao montar overview analítico")
-        raise HTTPException(status_code=500, detail="Erro ao montar overview analítico.")
+    _ = request
+    return ClusterOverviewResponse(items=[])
 
 
 @app.get(
@@ -1604,43 +1602,8 @@ async def api_cluster_overview(request: Request) -> ClusterOverviewResponse:
     summary="Top insights por cluster",
 )
 async def api_cluster_insights(request: Request) -> ClusterInsightsResponse:
-    client = get_vcenter_client(request)
-    try:
-        summaries = await list_clusters(client)
-        items: list[ClusterInsightItem] = []
-        for summary in summaries:
-            cluster_id = str(summary.get("id", ""))
-            detail = await get_cluster_detail(client, cluster_id)
-            if not detail:
-                continue
-            recs = await get_pending_recommendations(client, cluster_id)
-            config = _build_cluster_config(summary, detail)
-            history_by_datastore = _datastore_history_map(request, cluster_id)
-            cluster_history = _cluster_history_points(request, cluster_id)
-            derived = _build_cluster_derived(detail, config)
-            derived = _apply_cluster_growth_from_history(derived, cluster_history)
-            suitability = _build_cluster_suitability(detail, derived)
-            metrics = _build_datastore_metrics(
-                cluster_id,
-                detail,
-                config,
-                history_by_datastore=history_by_datastore,
-            )
-            pending_payload = _build_pending_recommendations(cluster_id, recs)
-            _capture_cluster_history(
-                request,
-                cluster_id,
-                derived,
-                metrics,
-                pending_payload.summary.pending_count,
-            )
-            items.append(_build_insight_item(summary, config, derived, suitability, pending_payload))
-        return ClusterInsightsResponse(items=items)
-    except VCenterClientError as exc:
-        raise _map_vcenter_error(exc)
-    except Exception:
-        logger.exception("Erro inesperado ao montar insights de cluster")
-        raise HTTPException(status_code=500, detail="Erro ao montar insights de cluster.")
+    _ = request
+    return ClusterInsightsResponse(items=[])
 
 
 @app.get(
@@ -1652,37 +1615,12 @@ async def api_cluster_insights(request: Request) -> ClusterInsightsResponse:
 async def api_cluster_typed_detail(request: Request, cluster_id: str) -> ClusterDetailResponse:
     client = get_vcenter_client(request)
     try:
-        summaries = await list_clusters(client)
-        summary = next((x for x in summaries if str(x.get("id")) == cluster_id), None)
-        if summary is None:
-            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
-
-        detail = await get_cluster_detail(client, cluster_id)
-        if not detail:
-            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
-
-        recs = await get_pending_recommendations(client, cluster_id)
-        config = _build_cluster_config(summary, detail)
-        history_by_datastore = _datastore_history_map(request, cluster_id)
-        cluster_history = _cluster_history_points(request, cluster_id)
-        derived = _build_cluster_derived(detail, config)
-        derived = _apply_cluster_growth_from_history(derived, cluster_history)
-        suitability = _build_cluster_suitability(detail, derived)
-        metrics = _build_datastore_metrics(
-            cluster_id,
-            detail,
-            config,
-            history_by_datastore=history_by_datastore,
+        summary = await _require_cluster_exists(client, cluster_id)
+        return _empty_cluster_detail_payload(
+            cluster_id=cluster_id,
+            cluster_name=str(summary.get("name") or "Unknown"),
+            datastore_count=int(summary.get("datastore_count") or 0),
         )
-        pending_payload = _build_pending_recommendations(cluster_id, recs)
-        _capture_cluster_history(
-            request,
-            cluster_id,
-            derived,
-            metrics,
-            pending_payload.summary.pending_count,
-        )
-        return ClusterDetailResponse(config=config, derived=derived, suitability=suitability)
     except HTTPException:
         raise
     except VCenterClientError as exc:
@@ -1701,35 +1639,8 @@ async def api_cluster_typed_detail(request: Request, cluster_id: str) -> Cluster
 async def api_cluster_datastore_metrics(request: Request, cluster_id: str) -> DatastoreMetricsResponse:
     client = get_vcenter_client(request)
     try:
-        summaries = await list_clusters(client)
-        summary = next((x for x in summaries if str(x.get("id")) == cluster_id), None)
-        if summary is None:
-            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
-
-        detail = await get_cluster_detail(client, cluster_id)
-        if not detail:
-            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
-        recs = await get_pending_recommendations(client, cluster_id)
-        config = _build_cluster_config(summary, detail)
-        history_by_datastore = _datastore_history_map(request, cluster_id)
-        cluster_history = _cluster_history_points(request, cluster_id)
-        metrics = _build_datastore_metrics(
-            cluster_id,
-            detail,
-            config,
-            history_by_datastore=history_by_datastore,
-        )
-        derived = _build_cluster_derived(detail, config)
-        derived = _apply_cluster_growth_from_history(derived, cluster_history)
-        pending_payload = _build_pending_recommendations(cluster_id, recs)
-        _capture_cluster_history(
-            request,
-            cluster_id,
-            derived,
-            metrics,
-            pending_payload.summary.pending_count,
-        )
-        return metrics
+        await _require_cluster_exists(client, cluster_id)
+        return DatastoreMetricsResponse(items=[])
     except HTTPException:
         raise
     except VCenterClientError as exc:
@@ -1748,34 +1659,8 @@ async def api_cluster_datastore_metrics(request: Request, cluster_id: str) -> Da
 async def api_cluster_trends(request: Request, cluster_id: str) -> ClusterTrendsResponse:
     client = get_vcenter_client(request)
     try:
-        summaries = await list_clusters(client)
-        summary = next((x for x in summaries if str(x.get("id")) == cluster_id), None)
-        if summary is None:
-            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
-        detail = await get_cluster_detail(client, cluster_id)
-        if not detail:
-            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
-        recs = await get_pending_recommendations(client, cluster_id)
-        config = _build_cluster_config(summary, detail)
-        history_by_datastore = _datastore_history_map(request, cluster_id)
-        metrics = _build_datastore_metrics(
-            cluster_id,
-            detail,
-            config,
-            history_by_datastore=history_by_datastore,
-        )
-        derived = _build_cluster_derived(detail, config)
-        pending_payload = _build_pending_recommendations(cluster_id, recs)
-        _capture_cluster_history(
-            request,
-            cluster_id,
-            derived,
-            metrics,
-            pending_payload.summary.pending_count,
-        )
-        cluster_history = _cluster_history_points(request, cluster_id)
-        derived = _apply_cluster_growth_from_history(derived, cluster_history)
-        return _build_trends(derived, pending_payload, cluster_history=cluster_history)
+        await _require_cluster_exists(client, cluster_id)
+        return _empty_cluster_trends_payload()
     except HTTPException:
         raise
     except VCenterClientError as exc:
@@ -1796,8 +1681,10 @@ async def api_cluster_pending_recommendations(
 ) -> PendingRecommendationsResponse:
     client = get_vcenter_client(request)
     try:
-        recs = await get_pending_recommendations(client, cluster_id)
-        return _build_pending_recommendations(cluster_id, recs)
+        await _require_cluster_exists(client, cluster_id)
+        return _build_pending_recommendations(cluster_id, [])
+    except HTTPException:
+        raise
     except VCenterClientError as exc:
         raise _map_vcenter_error(exc)
     except Exception:
@@ -1816,9 +1703,11 @@ async def api_cluster_recommendation_stats(
 ) -> RecommendationStatsResponse:
     client = get_vcenter_client(request)
     try:
-        recs = await get_pending_recommendations(client, cluster_id)
-        pending_payload = _build_pending_recommendations(cluster_id, recs)
+        await _require_cluster_exists(client, cluster_id)
+        pending_payload = _build_pending_recommendations(cluster_id, [])
         return _build_recommendation_stats(pending_payload)
+    except HTTPException:
+        raise
     except VCenterClientError as exc:
         raise _map_vcenter_error(exc)
     except Exception:
@@ -1835,34 +1724,8 @@ async def api_cluster_recommendation_stats(
 async def api_cluster_risk(request: Request, cluster_id: str) -> ClusterRiskResponse:
     client = get_vcenter_client(request)
     try:
-        summaries = await list_clusters(client)
-        summary = next((x for x in summaries if str(x.get("id")) == cluster_id), None)
-        if summary is None:
-            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
-        detail = await get_cluster_detail(client, cluster_id)
-        if not detail:
-            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
-        recs = await get_pending_recommendations(client, cluster_id)
-        config = _build_cluster_config(summary, detail)
-        history_by_datastore = _datastore_history_map(request, cluster_id)
-        cluster_history = _cluster_history_points(request, cluster_id)
-        metrics = _build_datastore_metrics(
-            cluster_id,
-            detail,
-            config,
-            history_by_datastore=history_by_datastore,
-        )
-        derived = _build_cluster_derived(detail, config)
-        derived = _apply_cluster_growth_from_history(derived, cluster_history)
-        pending_payload = _build_pending_recommendations(cluster_id, recs)
-        _capture_cluster_history(
-            request,
-            cluster_id,
-            derived,
-            metrics,
-            pending_payload.summary.pending_count,
-        )
-        return _build_cluster_risk(cluster_id, metrics, pending_payload)
+        await _require_cluster_exists(client, cluster_id)
+        return ClusterRiskResponse(near_full=[], maintenance=[], constraints=[])
     except HTTPException:
         raise
     except VCenterClientError as exc:

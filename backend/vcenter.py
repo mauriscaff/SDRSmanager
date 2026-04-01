@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -18,6 +19,60 @@ def _parse_bool(value: str | None, default: bool = True) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+@dataclass(frozen=True)
+class SecondaryVCenterConfig:
+    name: str
+    host: str
+    user: str
+    password: str
+    verify_ssl: bool
+
+
+def load_secondary_vcenter_configs(load_env_file: bool = True) -> tuple[list[SecondaryVCenterConfig], list[str]]:
+    """
+    Formato:
+    VCENTER_SECONDARY_NAMES=S2002,S2003
+    VCENTER_S2002_HOST=...
+    VCENTER_S2002_USER=...
+    VCENTER_S2002_PASSWORD=...
+    VCENTER_S2002_VERIFY_SSL=false
+    """
+    if load_env_file:
+        load_dotenv()
+
+    raw_names = (os.getenv("VCENTER_SECONDARY_NAMES") or "").strip()
+    if not raw_names:
+        return [], []
+
+    warnings: list[str] = []
+    configs: list[SecondaryVCenterConfig] = []
+    names = [item.strip() for item in raw_names.split(",") if item.strip()]
+
+    for name in names:
+        key = name.upper()
+        raw_host = (os.getenv(f"VCENTER_{key}_HOST") or "").strip()
+        host = raw_host.replace("https://", "").replace("http://", "").rstrip("/")
+        user = (os.getenv(f"VCENTER_{key}_USER") or "").strip()
+        password = os.getenv(f"VCENTER_{key}_PASSWORD") or ""
+        verify_ssl = _parse_bool(os.getenv(f"VCENTER_{key}_VERIFY_SSL"), default=True)
+
+        if not host or not user or not password:
+            warnings.append(f"Configuração secundária '{name}' incompleta; ignorando.")
+            continue
+
+        configs.append(
+            SecondaryVCenterConfig(
+                name=name,
+                host=host,
+                user=user,
+                password=password,
+                verify_ssl=verify_ssl,
+            )
+        )
+
+    return configs, warnings
 
 
 class VCenterClient:
