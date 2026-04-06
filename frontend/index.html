@@ -133,6 +133,15 @@
         error: "",
         active: false
       },
+      operationHistory: [],
+      readOnlyForm: {
+        key: "",
+        target: "true"
+      },
+      latencyDiagnostics: {
+        payload: null,
+        checkedAt: ""
+      },
 
       loading: {
         health: false,
@@ -149,6 +158,9 @@
         taskStatus: false,
         clusterEnhancement: false,
         vcenterConfig: false,
+        readOnlyToggle: false,
+        latencyDiagnostics: false,
+        history: false,
         action: false
       },
 
@@ -165,7 +177,10 @@
         moveOptions: "",
         vmMove: "",
         taskStatus: "",
-        vcenterConfig: ""
+        vcenterConfig: "",
+        readOnlyToggle: "",
+        latencyDiagnostics: "",
+        history: ""
       },
 
       vcenterForm: {
@@ -224,6 +239,13 @@
       return `${formatNumber(value, 2)} ms`;
     }
 
+    function formatDateTime(value) {
+      if (!value) return "—";
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return String(value);
+      return d.toLocaleString();
+    }
+
     function statusBadge(label, tone = "slate") {
       const map = {
         teal: "bg-teal-50 text-teal-700 border-teal-200",
@@ -263,6 +285,8 @@
       const policy = getSafetyPolicy();
       const blockedOps = Array.isArray(policy.blocked_vm_operations) ? policy.blocked_vm_operations : [];
       const adminKeyRequired = policy.write_admin_key_required === true;
+      const readOnlyToggleKeyRequired = policy.read_only_toggle_key_required === true;
+      const readOnlyToggleOpen = policy.read_only_toggle_open !== false;
       const blockedSummary = blockedOps.length
         ? blockedOps.slice(0, 4).join(", ")
         : "Destroy_Task, UnregisterVM, PowerOffVM_Task, ReconfigVM_Task";
@@ -280,6 +304,8 @@
             Operações de VM bloqueadas: ${escapeHtml(blockedSummary)}
           </div>
           ${adminKeyRequired ? '<div class="mt-1 text-xs opacity-90">Escrita exige X-Admin-Key configurada no backend.</div>' : ""}
+          ${readOnlyToggleKeyRequired ? '<div class="mt-1 text-xs opacity-90">Alternância de read-only exige X-Readonly-Key (aba Settings).</div>' : ""}
+          ${readOnlyToggleOpen ? '<div class="mt-1 text-xs opacity-90">Alternância de read-only liberada localmente (aba Settings).</div>' : ""}
         </div>
       `;
     }
@@ -322,6 +348,7 @@
       if (hash === "dashboard") return { name: "dashboard", clusterId: null, datastoreId: null };
       if (hash === "clusters") return { name: "clusters", clusterId: null, datastoreId: null };
       if (hash === "recommendations") return { name: "recommendations", clusterId: null, datastoreId: null };
+      if (hash === "history") return { name: "history", clusterId: null, datastoreId: null };
       if (hash === "vcenter") return { name: "vcenter", clusterId: null, datastoreId: null };
       if (hash === "settings") return { name: "settings", clusterId: null, datastoreId: null };
 
@@ -365,7 +392,7 @@
       const detail = payload?.detail || payload?.message || "";
 
       if (status === 401) {
-        return detail || "401 não autorizado. Verifique credenciais/chave de acesso.";
+        return detail || "401 não autorizado. Verifique credenciais/chave (X-Admin-Key ou X-Readonly-Key).";
       }
       if (status === 403) {
         return detail || "403 bloqueado por política de segurança (read-only ou regra de escrita).";
@@ -558,6 +585,99 @@
         showToast(friendly, "error");
       } finally {
         state.loading.vcenterConfig = false;
+        render();
+      }
+    }
+
+    async function setReadOnlyModeRuntime(readOnly) {
+      const key = String(state.readOnlyForm.key || "").trim();
+      const keyRequired = getSafetyPolicy().read_only_toggle_key_required === true;
+      if (keyRequired && !key) {
+        showToast("Informe a chave de alternância (X-Readonly-Key).", "error");
+        return;
+      }
+
+      state.loading.readOnlyToggle = true;
+      state.errors.readOnlyToggle = "";
+      render();
+
+      try {
+        const headers = {};
+        if (key) {
+          headers["X-Readonly-Key"] = key;
+        }
+        const payload = await apiFetch("/api/safety/read-only", {
+          method: "POST",
+          headers,
+          body: {
+            read_only: !!readOnly
+          }
+        });
+
+        if (state.health) {
+          state.health.read_only = !!payload?.read_only;
+        }
+        await loadHealth(true);
+        showToast(
+          payload?.read_only === false
+            ? "Modo writable ativado em runtime."
+            : "Modo read-only ativado em runtime.",
+          "success"
+        );
+      } catch (error) {
+        state.errors.readOnlyToggle = error.message;
+        showToast(error.message, "error");
+      } finally {
+        state.loading.readOnlyToggle = false;
+        render();
+      }
+    }
+
+    async function runLatencyDiagnostics(clusterId = null) {
+      state.loading.latencyDiagnostics = true;
+      state.errors.latencyDiagnostics = "";
+      render();
+
+      const query = clusterId
+        ? `?cluster_id=${encodeURIComponent(clusterId)}&max_datastores=8`
+        : "?max_datastores=8";
+
+      try {
+        const payload = await apiFetch(`/api/diagnostics/latency${query}`);
+        state.latencyDiagnostics = {
+          payload: payload || null,
+          checkedAt: new Date().toISOString()
+        };
+        const msg = String(payload?.message || "").trim();
+        if (msg) {
+          showToast(msg, "info");
+        } else {
+          showToast("Diagnóstico de latência concluído.", "success");
+        }
+      } catch (error) {
+        state.errors.latencyDiagnostics = error.message;
+        showToast(`Falha no diagnóstico de latência: ${error.message}`, "error");
+      } finally {
+        state.loading.latencyDiagnostics = false;
+        render();
+      }
+    }
+
+    async function loadOperationHistory(force = false, limit = 200) {
+      if (state.loading.history && !force) return;
+      if (state.operationHistory.length && !force) return;
+
+      state.loading.history = true;
+      state.errors.history = "";
+      render();
+
+      try {
+        const payload = await apiFetch(`/api/history?limit=${encodeURIComponent(limit)}`);
+        state.operationHistory = Array.isArray(payload?.items) ? payload.items : [];
+      } catch (error) {
+        state.errors.history = error.message;
+      } finally {
+        state.loading.history = false;
         render();
       }
     }
@@ -1350,6 +1470,79 @@
       `;
     }
 
+    function renderOperationHistoryTable(theme) {
+      if (state.loading.history && !state.operationHistory.length) {
+        return `<div class="space-y-2">${Array.from({ length: 10 }).map(() => `<div class="skeleton h-10 rounded-2xl"></div>`).join("")}</div>`;
+      }
+
+      if (!state.operationHistory.length) {
+        return `<div class="rounded-2xl border ${theme.rowBorder} p-4 text-sm ${theme.subtle}">Nenhum evento registrado ainda.</div>`;
+      }
+
+      return `
+        <div class="max-h-[520px] overflow-auto rounded-2xl border ${theme.rowBorder}">
+          <table class="min-w-full">
+            <thead class="${theme.tableHead}">
+              <tr>
+                <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide">Data/Hora</th>
+                <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide">Ação</th>
+                <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide">Status</th>
+                <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide">Método</th>
+                <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide">Path</th>
+                <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide">Detalhes</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${state.operationHistory.map((item) => `
+                <tr class="border-t ${theme.rowBorder}">
+                  <td class="px-3 py-2 text-xs ${theme.subtle} whitespace-nowrap">${escapeHtml(formatDateTime(item.ts))}</td>
+                  <td class="px-3 py-2 text-xs font-semibold">${escapeHtml(item.action || "unknown")}</td>
+                  <td class="px-3 py-2 text-xs">
+                    ${
+                      String(item.status || "").toLowerCase() === "ok"
+                        ? statusBadge("ok", "emerald")
+                        : String(item.status || "").toLowerCase().includes("error")
+                          ? statusBadge(String(item.status || "error"), "rose")
+                          : statusBadge(String(item.status || "info"), "amber")
+                    }
+                  </td>
+                  <td class="px-3 py-2 text-xs ${theme.subtle} whitespace-nowrap">${escapeHtml(item.method || "—")}</td>
+                  <td class="px-3 py-2 text-xs ${theme.subtle} whitespace-nowrap">${escapeHtml(item.path || "—")}</td>
+                  <td class="px-3 py-2 text-xs ${theme.subtle}">${escapeHtml(summarizeHistoryDetails(item) || "—")}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function summarizeHistoryDetails(entry) {
+      const details = entry?.details || {};
+      const action = String(entry?.action || "");
+      if (action === "vm_move_request") {
+        const vm = details.vm_id ? `VM ${details.vm_id}` : "VM n/d";
+        const fromDs = details.source_datastore_id ? `de ${details.source_datastore_id}` : "";
+        const toDs = details.target_datastore_id ? `para ${details.target_datastore_id}` : "";
+        const task = details.task_id ? `task ${details.task_id}` : "";
+        const reason = details.reason || details.error || "";
+        return [vm, fromDs, toDs, task, reason].filter(Boolean).join(" · ");
+      }
+      if (action === "read_only_toggle") {
+        return `read_only: ${details.previous_read_only} -> ${details.current_read_only}`;
+      }
+      if (action === "vcenter_config_set") {
+        return [details.host, details.user, details.error].filter(Boolean).join(" · ");
+      }
+      if (action === "task_status_query") {
+        return [details.task_id, details.state, details.error].filter(Boolean).join(" · ");
+      }
+      const compact = Object.entries(details)
+        .slice(0, 4)
+        .map(([k, v]) => `${k}=${String(v)}`);
+      return compact.join(" · ");
+    }
+
     function renderDashboard() {
       const theme = getThemeClasses();
       const kpi = computeKpis();
@@ -1604,10 +1797,44 @@
 
       const datastores = Array.isArray(detail.datastores) ? detail.datastores : [];
       const selectedDs = state.selectedDatastore;
+      const latencyValues = datastores
+        .map((ds) => ds.latency_ms)
+        .filter((v) => v !== null && v !== undefined && !Number.isNaN(Number(v)));
+      const latencyMissing = datastores.length > 0 && latencyValues.length === 0;
+      const diagPayload = state.latencyDiagnostics?.payload || null;
+      const diagForCurrentCluster = Boolean(
+        diagPayload &&
+        (!diagPayload.cluster_filter || String(diagPayload.cluster_filter) === String(clusterId))
+      );
+      const diagMessage = diagForCurrentCluster ? String(diagPayload?.message || "").trim() : "";
 
       return `
         ${renderReadOnlyBanner()}
-        ${errorBanner(state.errors.clusterDetail || state.errors.clusterRecommendations || state.errors.clusterCandidates || state.errors.clusterSimulation || state.errors.datastoreVms || state.errors.moveOptions || state.errors.taskStatus || state.errors.vmMove)}
+        ${errorBanner(state.errors.clusterDetail || state.errors.clusterRecommendations || state.errors.clusterCandidates || state.errors.clusterSimulation || state.errors.datastoreVms || state.errors.moveOptions || state.errors.taskStatus || state.errors.vmMove || state.errors.latencyDiagnostics)}
+        ${
+          latencyMissing
+            ? `
+              <div class="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                <div class="font-semibold">Latência indisponível para este cluster.</div>
+                <div class="mt-1">
+                  O vCenter não retornou métricas de latência para os datastores carregados.
+                </div>
+                ${diagMessage ? `<div class="mt-1 text-xs opacity-90">${escapeHtml(diagMessage)}</div>` : ""}
+                <div class="mt-3">
+                  <button
+                    data-action="run-latency-diagnostics"
+                    data-cluster-id="${escapeHtml(clusterId)}"
+                    class="inline-flex items-center gap-2 rounded-2xl border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-100 ${state.loading.latencyDiagnostics ? "opacity-70 cursor-not-allowed" : ""}"
+                    ${state.loading.latencyDiagnostics ? "disabled" : ""}
+                  >
+                    <i data-lucide="stethoscope" class="w-4 h-4"></i>
+                    ${state.loading.latencyDiagnostics ? "Diagnosticando..." : "Diagnosticar latência"}
+                  </button>
+                </div>
+              </div>
+            `
+            : ""
+        }
         <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
           <div class="px-6 py-5 border-b ${theme.divider}">
             <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
@@ -2005,6 +2232,13 @@
       if (!datastore) {
         return `${errorBanner(state.errors.clusterDetail || state.errors.datastoreVms)}${emptyState("Datastore não encontrado", "Este datastore não foi localizado no cluster informado.")}`;
       }
+      const latencyUnavailable = datastore.latency_ms === null || datastore.latency_ms === undefined || Number.isNaN(Number(datastore.latency_ms));
+      const diagPayload = state.latencyDiagnostics?.payload || null;
+      const diagForCurrentCluster = Boolean(
+        diagPayload &&
+        (!diagPayload.cluster_filter || String(diagPayload.cluster_filter) === String(clusterId))
+      );
+      const diagMessage = diagForCurrentCluster ? String(diagPayload?.message || "").trim() : "";
 
       const key = datastoreKey(clusterId, datastoreId);
       const payload = state.datastoreVms[key] || { items: [] };
@@ -2041,7 +2275,28 @@
 
       return `
         ${renderReadOnlyBanner()}
-        ${errorBanner(state.errors.clusterDetail || state.errors.clusterSimulation || state.errors.datastoreVms || state.errors.moveOptions || state.errors.taskStatus || state.errors.vmMove)}
+        ${errorBanner(state.errors.clusterDetail || state.errors.clusterSimulation || state.errors.datastoreVms || state.errors.moveOptions || state.errors.taskStatus || state.errors.vmMove || state.errors.latencyDiagnostics)}
+        ${
+          latencyUnavailable
+            ? `
+              <div class="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                <div class="font-semibold">Latência deste datastore não foi retornada pelo vCenter.</div>
+                ${diagMessage ? `<div class="mt-1 text-xs opacity-90">${escapeHtml(diagMessage)}</div>` : ""}
+                <div class="mt-3">
+                  <button
+                    data-action="run-latency-diagnostics"
+                    data-cluster-id="${escapeHtml(clusterId)}"
+                    class="inline-flex items-center gap-2 rounded-2xl border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 hover:bg-amber-100 ${state.loading.latencyDiagnostics ? "opacity-70 cursor-not-allowed" : ""}"
+                    ${state.loading.latencyDiagnostics ? "disabled" : ""}
+                  >
+                    <i data-lucide="stethoscope" class="w-4 h-4"></i>
+                    ${state.loading.latencyDiagnostics ? "Diagnosticando..." : "Diagnosticar latência"}
+                  </button>
+                </div>
+              </div>
+            `
+            : ""
+        }
 
         <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
           <div class="px-6 py-5 border-b ${theme.divider}">
@@ -2587,8 +2842,12 @@
       const moveScope = (Array.isArray(safetyPolicy.allowed_write_operations) && safetyPolicy.allowed_write_operations.includes("vm_storage_relocate"))
         ? "Somente move datastore"
         : "Sem escrita";
+      const toggleKeyRequired = safetyPolicy.read_only_toggle_key_required === true;
+      const toggleOpen = safetyPolicy.read_only_toggle_open !== false;
+      const historyEnabled = safetyPolicy.operation_history_enabled !== false;
       return `
         ${renderReadOnlyBanner()}
+        ${errorBanner(state.errors.readOnlyToggle || state.errors.history)}
         <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
           <div class="xl:col-span-2 rounded-3xl border p-6 shadow-soft ${theme.panel}">
             <div class="mb-6">
@@ -2626,6 +2885,102 @@
                 </button>
               </div>
             </form>
+
+            <div class="my-6 border-t ${theme.divider}"></div>
+
+            <div class="mb-4">
+              <h3 class="text-lg font-semibold">Read-only runtime control</h3>
+              <p class="text-sm ${theme.subtle}">
+                Alterna o backend sem reiniciar usando o endpoint <code>/api/safety/read-only</code>.
+              </p>
+            </div>
+
+            <form id="read-only-form" class="space-y-4">
+              ${
+                toggleKeyRequired
+                  ? `
+                    <div>
+                      <label for="readonlyToggleKey" class="mb-2 block text-sm font-semibold">Chave de alternância</label>
+                      <input
+                        id="readonlyToggleKey"
+                        name="readonlyToggleKey"
+                        type="password"
+                        value="${escapeHtml(state.readOnlyForm.key)}"
+                        class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                        placeholder="READ_ONLY_TOGGLE_KEY"
+                      />
+                      <p class="mt-2 text-xs ${theme.subtle}">
+                        Essa chave é configurada no backend em <code>.env</code> como <code>READ_ONLY_TOGGLE_KEY</code> (fallback: <code>WRITE_ADMIN_KEY</code>).
+                      </p>
+                    </div>
+                  `
+                  : ""
+              }
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label for="targetReadOnly" class="mb-2 block text-sm font-semibold">Modo alvo</label>
+                  <select
+                    id="targetReadOnly"
+                    name="targetReadOnly"
+                    class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                  >
+                    <option value="true" ${state.readOnlyForm.target === "true" ? "selected" : ""}>Read-only</option>
+                    <option value="false" ${state.readOnlyForm.target === "false" ? "selected" : ""}>Writable</option>
+                  </select>
+                </div>
+
+                <div class="flex items-end">
+                  <button
+                    type="submit"
+                    class="inline-flex w-full items-center justify-center rounded-2xl bg-teal-600 px-4 py-3 text-sm font-semibold text-white hover:bg-teal-700 ${state.loading.readOnlyToggle ? "opacity-70 cursor-not-allowed" : ""}"
+                    ${state.loading.readOnlyToggle ? "disabled" : ""}
+                  >
+                    ${state.loading.readOnlyToggle ? "Aplicando..." : "Aplicar modo"}
+                  </button>
+                </div>
+              </div>
+
+              <div class="text-xs ${theme.subtle}">
+                ${toggleOpen
+                  ? "Modo automático local ativo: basta selecionar o modo e aplicar."
+                  : (toggleKeyRequired
+                    ? "Toggle key exigida pelo backend."
+                    : "Toggle sem chave habilitado.")}
+              </div>
+            </form>
+
+            <div class="my-6 border-t ${theme.divider}"></div>
+
+            <div class="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <h3 class="text-lg font-semibold">Histórico operacional</h3>
+                <p class="text-sm ${theme.subtle}">
+                  Registro das ações executadas no backend.
+                </p>
+              </div>
+              <button
+                type="button"
+                data-action="refresh-history"
+                class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder} ${state.loading.history ? "opacity-70 cursor-not-allowed" : ""}"
+                ${state.loading.history ? "disabled" : ""}
+              >
+                <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                ${state.loading.history ? "Atualizando..." : "Atualizar"}
+              </button>
+            </div>
+
+            ${
+              !historyEnabled
+                ? `<div class="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">Histórico desabilitado no backend.</div>`
+                : state.loading.history && !state.operationHistory.length
+                  ? `<div class="space-y-2">${Array.from({ length: 6 }).map(() => `<div class="skeleton h-10 rounded-2xl"></div>`).join("")}</div>`
+                  : !state.operationHistory.length
+                    ? `<div class="rounded-2xl border ${theme.rowBorder} p-4 text-sm ${theme.subtle}">Nenhum evento registrado ainda.</div>`
+                    : `
+                      ${renderOperationHistoryTable(theme)}
+                    `
+            }
           </div>
 
           <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
@@ -2670,6 +3025,34 @@
       `;
     }
 
+    function renderHistory() {
+      const theme = getThemeClasses();
+      return `
+        ${renderReadOnlyBanner()}
+        ${errorBanner(state.errors.history)}
+        <section class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
+          <div class="mb-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <h3 class="text-lg font-semibold">Histórico operacional</h3>
+              <p class="text-sm ${theme.subtle}">
+                Registro cronológico de ações executadas pelo backend (startup, toggle read-only, moves, tasks, diagnóstico, etc.).
+              </p>
+            </div>
+            <button
+              type="button"
+              data-action="refresh-history"
+              class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder} ${state.loading.history ? "opacity-70 cursor-not-allowed" : ""}"
+              ${state.loading.history ? "disabled" : ""}
+            >
+              <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+              ${state.loading.history ? "Atualizando..." : "Atualizar"}
+            </button>
+          </div>
+          ${renderOperationHistoryTable(theme)}
+        </section>
+      `;
+    }
+
     function renderContent() {
       switch (state.route.name) {
         case "clusters":
@@ -2680,6 +3063,8 @@
           return renderDatastoreDetail();
         case "recommendations":
           return renderRecommendations();
+        case "history":
+          return renderHistory();
         case "vcenter":
           return renderVcenter();
         case "settings":
@@ -2701,6 +3086,7 @@
         return { label: "Datastore Detail", title: ds?.name || "Datastore" };
       }
       if (state.route.name === "recommendations") return { label: "Operations", title: "Recommendations" };
+      if (state.route.name === "history") return { label: "Operations", title: "History" };
       if (state.route.name === "vcenter") return { label: "Configuration", title: "vCenter" };
       if (state.route.name === "settings") return { label: "Configuration", title: "Settings" };
       return { label: "Overview", title: "Dashboard" };
@@ -2873,6 +3259,7 @@
               ${navItem("dashboard", "layout-dashboard", "Dashboard", "#dashboard")}
               ${navItem("clusters", "folders", "Clusters", "#clusters")}
               ${navItem("recommendations", "arrow-right-left", "Recommendations", "#recommendations")}
+              ${navItem("history", "history", "History", "#history")}
               ${navItem("vcenter", "server-cog", "vCenter", "#vcenter")}
               ${navItem("settings", "settings", "Settings", "#settings")}
             </nav>
@@ -3020,6 +3407,12 @@
       }
 
       if (route.name === "settings") {
+        await loadOperationHistory();
+        return;
+      }
+
+      if (route.name === "history") {
+        await loadOperationHistory();
         return;
       }
     }
@@ -3073,6 +3466,11 @@
         return;
       }
 
+      if (action === "refresh-history") {
+        await loadOperationHistory(true);
+        return;
+      }
+
       if (action === "refresh-cluster") {
         const clusterId = trigger.dataset.clusterId;
         if (!clusterId) return;
@@ -3109,6 +3507,12 @@
         if (!clusterId) return;
         delete state.clusterSimulation[clusterId];
         await loadClusterSimulation(clusterId, true);
+        return;
+      }
+
+      if (action === "run-latency-diagnostics") {
+        const clusterId = String(trigger.dataset.clusterId || "").trim() || null;
+        await runLatencyDiagnostics(clusterId);
         return;
       }
 
@@ -3227,7 +3631,7 @@
 
     document.addEventListener("submit", async (event) => {
       const form = event.target;
-      if (!(form.id === "settings-form" || form.id === "vcenter-form" || form.id === "move-vm-form")) return;
+      if (!(form.id === "settings-form" || form.id === "read-only-form" || form.id === "vcenter-form" || form.id === "move-vm-form")) return;
 
       event.preventDefault();
 
@@ -3254,11 +3658,13 @@
         state.datastoreVms = {};
         state.allRecommendations = [];
         state.allCandidates = [];
+        state.operationHistory = [];
         state.selectedDatastore = { clusterId: "", datastoreId: "", datastoreName: "" };
         state.moveForm = { clusterId: "", sourceDatastoreId: "", vmId: "", targetDatastoreId: "" };
         state.moveOptionsByVm = {};
         state.movePreview = null;
         state.moveConfirm.open = false;
+        state.errors.history = "";
         stopMoveTaskPolling();
         state.moveTask = { taskId: "", state: "", progress: null, error: "", active: false };
         showToast("URL do backend atualizada só nesta sessão.", "success");
@@ -3277,6 +3683,14 @@
 
         await saveVcenterConfig(true);
         await connectVcenter(true);
+        return;
+      }
+
+      if (form.id === "read-only-form") {
+        const formData = new FormData(form);
+        state.readOnlyForm.key = String(formData.get("readonlyToggleKey") || "");
+        state.readOnlyForm.target = String(formData.get("targetReadOnly") || "true").trim() === "false" ? "false" : "true";
+        await setReadOnlyModeRuntime(state.readOnlyForm.target !== "false");
         return;
       }
 

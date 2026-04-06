@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -54,6 +58,7 @@ from sdrs import (
     list_datastore_vms,
     list_clusters,
     move_vm_to_datastore,
+    _invalidate_si,
 )
 from vcenter import VCenterClient, VCenterClientError, load_secondary_vcenter_configs
 
@@ -106,8 +111,16 @@ def _parse_csv_env(name: str, default: list[str]) -> list[str]:
 
 READ_ONLY_MODE = _parse_bool_env("READ_ONLY_MODE", default=True)
 HISTORY_RETENTION_HOURS = max(24, _parse_int_env("ANALYTICS_HISTORY_RETENTION_HOURS", 24 * 30))
+ROOT_DIR = Path(__file__).resolve().parent.parent
+AUDIT_HISTORY_MAX_ITEMS = max(100, _parse_int_env("AUDIT_HISTORY_MAX_ITEMS", 5000))
+AUDIT_HISTORY_FILE = Path(
+    (os.getenv("AUDIT_HISTORY_FILE") or str(ROOT_DIR / ".runtime" / "operation_history.jsonl")).strip()
+)
+_AUDIT_HISTORY_LOCK = threading.RLock()
 ALLOW_VM_STORAGE_MOVE = _parse_bool_env("ALLOW_VM_STORAGE_MOVE", default=True)
 WRITE_ADMIN_KEY = (os.getenv("WRITE_ADMIN_KEY") or "").strip()
+READ_ONLY_TOGGLE_KEY = (os.getenv("READ_ONLY_TOGGLE_KEY") or WRITE_ADMIN_KEY or "").strip()
+READ_ONLY_TOGGLE_OPEN = _parse_bool_env("READ_ONLY_TOGGLE_OPEN", default=True)
 
 DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:5500",
@@ -137,6 +150,10 @@ class VmMovePayload(BaseModel):
     source_datastore_id: str | None = None
 
 
+class ReadOnlyModePayload(BaseModel):
+    read_only: bool
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.vcenter_client = None
@@ -145,6 +162,7 @@ async def lifespan(app: FastAPI):
     app.state.secondary_vcenter_warnings = []
     app.state.read_only_mode = READ_ONLY_MODE
     app.state.analytics_history = {"clusters": {}, "datastores": {}}
+    app.state.operation_history = _load_audit_history_from_disk(AUDIT_HISTORY_MAX_ITEMS)
 
     try:
         client = VCenterClient()
@@ -162,6 +180,31 @@ async def lifespan(app: FastAPI):
     except Exception:
         app.state.vcenter_client_error = "Erro inesperado ao inicializar o cliente do vCenter."
         logger.exception("Falha inesperada ao inicializar VCenterClient")
+
+    _record_operation_event_app(
+        app,
+        action="backend_startup",
+        status_text="ok",
+        details={
+            "read_only_mode": app.state.read_only_mode,
+            "vcenter_initialized": app.state.vcenter_client is not None,
+            "history_file": str(_history_file_path()),
+        },
+    )
+
+    # Pre-aquece o cache de inventário em background para que a primeira requisição seja rápida
+    async def _warm_inventory_cache() -> None:
+        warmup_client = getattr(app.state, "vcenter_client", None)
+        if warmup_client is None:
+            return
+        try:
+            logger.info("Iniciando pre-aquecimento do cache de inventário vCenter...")
+            await list_clusters(warmup_client)
+            logger.info("Cache de inventário pre-aquecido com sucesso.")
+        except Exception as exc:
+            logger.warning("Falha no pre-aquecimento do cache: %s", exc)
+
+    asyncio.ensure_future(_warm_inventory_cache())
 
     secondary_cfgs, secondary_warnings = load_secondary_vcenter_configs()
     app.state.secondary_vcenter_warnings = list(secondary_warnings)
@@ -190,6 +233,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    _record_operation_event_app(
+        app,
+        action="backend_shutdown",
+        status_text="ok",
+        details={"read_only_mode": bool(getattr(app.state, "read_only_mode", True))},
+    )
+
     client = getattr(app.state, "vcenter_client", None)
     if client is not None:
         try:
@@ -214,6 +264,106 @@ app.add_middleware(
 )
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _history_file_path() -> Path:
+    return AUDIT_HISTORY_FILE
+
+
+def _load_audit_history_from_disk(max_items: int) -> list[dict[str, Any]]:
+    path = _history_file_path()
+    if not path.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    try:
+        for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                entries.append(parsed)
+    except Exception:
+        logger.warning("Falha ao carregar histórico de operações em %s", path, exc_info=True)
+        return []
+
+    if len(entries) > max_items:
+        entries = entries[-max_items:]
+    return entries
+
+
+def _append_audit_entry(app: FastAPI, entry: dict[str, Any]) -> None:
+    with _AUDIT_HISTORY_LOCK:
+        store = getattr(app.state, "operation_history", None)
+        if not isinstance(store, list):
+            store = []
+            app.state.operation_history = store
+        store.append(entry)
+        if len(store) > AUDIT_HISTORY_MAX_ITEMS:
+            del store[: len(store) - AUDIT_HISTORY_MAX_ITEMS]
+
+        path = _history_file_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fp:
+                fp.write(json.dumps(entry, ensure_ascii=False))
+                fp.write("\n")
+        except Exception:
+            logger.warning("Falha ao persistir evento no histórico em %s", path, exc_info=True)
+
+
+def _record_operation_event(
+    request: Request,
+    action: str,
+    status_text: str = "ok",
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry = {
+        "ts": _utc_now().isoformat(),
+        "action": str(action or "unknown"),
+        "status": str(status_text or "unknown"),
+        "method": str(getattr(request, "method", "") or ""),
+        "path": str(getattr(getattr(request, "url", None), "path", "") or ""),
+        "client_ip": str(getattr(getattr(request, "client", None), "host", "") or ""),
+        "details": _json_safe(details or {}),
+    }
+    _append_audit_entry(request.app, entry)
+    return entry
+
+
+def _record_operation_event_app(
+    app: FastAPI,
+    action: str,
+    status_text: str = "ok",
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry = {
+        "ts": _utc_now().isoformat(),
+        "action": str(action or "unknown"),
+        "status": str(status_text or "unknown"),
+        "method": "",
+        "path": "",
+        "client_ip": "",
+        "details": _json_safe(details or {}),
+    }
+    _append_audit_entry(app, entry)
+    return entry
+
+
 async def _replace_vcenter_client(
     request: Request,
     new_client: VCenterClient | None,
@@ -227,6 +377,10 @@ async def _replace_vcenter_client(
     request.app.state.vcenter_config = config
 
     if old_client is not None:
+        try:
+            _invalidate_si(old_client)
+        except Exception:
+            pass
         try:
             await old_client.close()
         except Exception:
@@ -247,10 +401,14 @@ def _get_move_guardrails() -> dict[str, Any]:
 
 
 def _get_safety_policy(request: Request) -> dict[str, Any]:
+    read_only_toggle_key_required = (not READ_ONLY_TOGGLE_OPEN) and bool(READ_ONLY_TOGGLE_KEY)
     return {
         "read_only_mode": _is_read_only_mode(request),
         "allow_vm_storage_move": ALLOW_VM_STORAGE_MOVE,
         "write_admin_key_required": bool(WRITE_ADMIN_KEY),
+        "read_only_toggle_key_required": read_only_toggle_key_required,
+        "read_only_toggle_open": READ_ONLY_TOGGLE_OPEN,
+        "operation_history_enabled": True,
         "move_confirmation_header_required": True,
         "forbid_vm_delete": True,
         "forbid_vm_power_actions": True,
@@ -270,6 +428,57 @@ def _require_admin_key_if_configured(request: Request) -> None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Cabeçalho X-Admin-Key ausente ou inválido.",
+        )
+
+
+def _is_loopback_request(request: Request) -> bool:
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", "") or "").strip().lower()
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+def _authorize_read_only_toggle(request: Request) -> None:
+    # Fluxo default para operação local: toggle sem chave.
+    if READ_ONLY_TOGGLE_OPEN:
+        if not _is_loopback_request(request):
+            _record_operation_event(
+                request,
+                action="read_only_toggle",
+                status_text="denied",
+                details={"reason": "non_loopback_in_open_mode"},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Alternância read-only aberta apenas para acesso local (loopback).",
+            )
+        return
+
+    if not READ_ONLY_TOGGLE_KEY:
+        _record_operation_event(
+            request,
+            action="read_only_toggle",
+            status_text="denied",
+            details={"reason": "missing_toggle_key_configuration"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Alternância de read-only protegida por chave, mas sem chave configurada. "
+                "Defina READ_ONLY_TOGGLE_KEY ou habilite READ_ONLY_TOGGLE_OPEN=true."
+            ),
+        )
+
+    provided = (request.headers.get("x-readonly-key") or "").strip()
+    if provided != READ_ONLY_TOGGLE_KEY:
+        _record_operation_event(
+            request,
+            action="read_only_toggle",
+            status_text="denied",
+            details={"reason": "invalid_readonly_key"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Cabeçalho X-Readonly-Key ausente ou inválido.",
         )
 
 
@@ -1062,6 +1271,71 @@ async def safety_policy(request: Request) -> dict[str, Any]:
     return _get_safety_policy(request)
 
 
+@app.get(
+    "/api/history",
+    tags=["system"],
+    summary="Histórico operacional",
+    description="Retorna histórico das ações executadas pelo backend (persistido em disco).",
+)
+async def operation_history(
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=2000),
+    action: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+) -> dict[str, Any]:
+    history = list(getattr(request.app.state, "operation_history", []) or [])
+
+    filtered = history
+    if action:
+        action_norm = str(action).strip().lower()
+        filtered = [item for item in filtered if str(item.get("action", "")).lower() == action_norm]
+    if status_filter:
+        status_norm = str(status_filter).strip().lower()
+        filtered = [item for item in filtered if str(item.get("status", "")).lower() == status_norm]
+
+    total = len(filtered)
+    items = filtered[-limit:]
+    items.reverse()
+    return {
+        "items": items,
+        "count": len(items),
+        "total": total,
+        "limit": limit,
+        "history_file": str(_history_file_path()),
+    }
+
+
+@app.post(
+    "/api/safety/read-only",
+    tags=["system"],
+    summary="Alterna read-only em runtime",
+    description=(
+        "Atualiza o modo de segurança read-only em memória (não persiste no .env). "
+        "Exige cabeçalho X-Readonly-Key."
+    ),
+)
+async def set_read_only_mode(request: Request, payload: ReadOnlyModePayload) -> dict[str, Any]:
+    _authorize_read_only_toggle(request)
+    previous = _is_read_only_mode(request)
+    request.app.state.read_only_mode = bool(payload.read_only)
+    current = _is_read_only_mode(request)
+    _record_operation_event(
+        request,
+        action="read_only_toggle",
+        status_text="ok",
+        details={
+            "previous_read_only": previous,
+            "current_read_only": current,
+            "toggle_open": READ_ONLY_TOGGLE_OPEN,
+        },
+    )
+    return {
+        "updated": True,
+        "read_only": current,
+        "source": "runtime",
+    }
+
+
 @app.post(
     "/api/vcenter/config",
     tags=["config"],
@@ -1080,6 +1354,12 @@ async def set_vcenter_config(request: Request, payload: VCenterConfigPayload) ->
             load_env_file=False,
         )
     except VCenterClientError as exc:
+        _record_operation_event(
+            request,
+            action="vcenter_config_set",
+            status_text="error",
+            details={"host": payload.host, "user": payload.user, "error": str(exc)},
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
@@ -1092,6 +1372,13 @@ async def set_vcenter_config(request: Request, payload: VCenterConfigPayload) ->
         "source": "runtime",
     }
     await _replace_vcenter_client(request, client, None, cfg)
+
+    _record_operation_event(
+        request,
+        action="vcenter_config_set",
+        status_text="ok",
+        details={"host": client.host, "user": client.user, "verify_ssl": client.verify_ssl},
+    )
 
     return {
         "configured": True,
@@ -1140,14 +1427,32 @@ async def auth_connect(request: Request) -> dict[str, Any]:
 
     try:
         await client.authenticate()
+        _record_operation_event(
+            request,
+            action="auth_connect",
+            status_text="ok",
+            details={"host": client.host},
+        )
         return {
             "connected": True,
             "host": client.host,
         }
     except VCenterClientError as exc:
+        _record_operation_event(
+            request,
+            action="auth_connect",
+            status_text="error",
+            details={"host": client.host, "error": str(exc)},
+        )
         raise _map_vcenter_error(exc)
     except Exception:
         logger.exception("Erro inesperado ao testar conexão com o vCenter")
+        _record_operation_event(
+            request,
+            action="auth_connect",
+            status_text="error",
+            details={"host": client.host, "error": "unexpected_error"},
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Erro inesperado ao conectar ao vCenter.",
@@ -1222,15 +1527,38 @@ async def api_diagnostics_latency(
     client = get_vcenter_client(request)
 
     try:
-        return await diagnose_latency_collection(
+        payload = await diagnose_latency_collection(
             client,
             cluster_id=cluster_id,
             max_datastores_per_cluster=max_datastores,
         )
+        _record_operation_event(
+            request,
+            action="latency_diagnostics",
+            status_text="ok",
+            details={
+                "cluster_id": cluster_id,
+                "max_datastores": max_datastores,
+                "message": payload.get("message"),
+            },
+        )
+        return payload
     except VCenterClientError as exc:
+        _record_operation_event(
+            request,
+            action="latency_diagnostics",
+            status_text="error",
+            details={"cluster_id": cluster_id, "error": str(exc)},
+        )
         raise _map_vcenter_error(exc)
     except Exception:
         logger.exception("Erro inesperado no diagnóstico de latência")
+        _record_operation_event(
+            request,
+            action="latency_diagnostics",
+            status_text="error",
+            details={"cluster_id": cluster_id, "error": "unexpected_error"},
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Erro inesperado ao executar diagnóstico de latência.",
@@ -1361,12 +1689,24 @@ async def api_move_vm(
     _require_admin_key_if_configured(request)
 
     if not ALLOW_VM_STORAGE_MOVE:
+        _record_operation_event(
+            request,
+            action="vm_move_request",
+            status_text="blocked",
+            details={"cluster_id": cluster_id, "vm_id": vm_id, "reason": "move_disabled_by_policy"},
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Move de VM entre datastores está desabilitado por política de segurança.",
         )
 
     if _is_read_only_mode(request):
+        _record_operation_event(
+            request,
+            action="vm_move_request",
+            status_text="blocked",
+            details={"cluster_id": cluster_id, "vm_id": vm_id, "reason": "read_only_mode"},
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Sistema em modo read-only durante a fase de testes.",
@@ -1374,6 +1714,12 @@ async def api_move_vm(
 
     confirm_header = (request.headers.get("x-confirm-storage-move") or "").strip().lower()
     if confirm_header not in {"yes", "true", "1"}:
+        _record_operation_event(
+            request,
+            action="vm_move_request",
+            status_text="blocked",
+            details={"cluster_id": cluster_id, "vm_id": vm_id, "reason": "missing_confirmation_header"},
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Confirmação explícita ausente. Envie o cabeçalho X-Confirm-Storage-Move: yes.",
@@ -1381,15 +1727,40 @@ async def api_move_vm(
 
     client = get_vcenter_client(request)
     try:
-        return await move_vm_to_datastore(
+        response = await move_vm_to_datastore(
             client=client,
             cluster_id=cluster_id,
             vm_id=vm_id,
             target_datastore_id=payload.target_datastore_id,
             source_datastore_id=payload.source_datastore_id,
         )
+        _record_operation_event(
+            request,
+            action="vm_move_request",
+            status_text="queued",
+            details={
+                "cluster_id": cluster_id,
+                "vm_id": vm_id,
+                "source_datastore_id": payload.source_datastore_id,
+                "target_datastore_id": payload.target_datastore_id,
+                "task_id": response.get("task_id"),
+            },
+        )
+        return response
     except SDRSOperationError as exc:
         message = str(exc)
+        _record_operation_event(
+            request,
+            action="vm_move_request",
+            status_text="error",
+            details={
+                "cluster_id": cluster_id,
+                "vm_id": vm_id,
+                "source_datastore_id": payload.source_datastore_id,
+                "target_datastore_id": payload.target_datastore_id,
+                "error": message,
+            },
+        )
         lowered = message.lower()
         if "não encontrado" in lowered:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=message)
@@ -1397,12 +1768,36 @@ async def api_move_vm(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=message)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
     except VCenterClientError as exc:
+        _record_operation_event(
+            request,
+            action="vm_move_request",
+            status_text="error",
+            details={
+                "cluster_id": cluster_id,
+                "vm_id": vm_id,
+                "source_datastore_id": payload.source_datastore_id,
+                "target_datastore_id": payload.target_datastore_id,
+                "error": str(exc),
+            },
+        )
         raise _map_vcenter_error(exc)
     except Exception:
         logger.exception(
             "Erro inesperado ao mover VM vm_id=%s cluster_id=%s",
             vm_id,
             cluster_id,
+        )
+        _record_operation_event(
+            request,
+            action="vm_move_request",
+            status_text="error",
+            details={
+                "cluster_id": cluster_id,
+                "vm_id": vm_id,
+                "source_datastore_id": payload.source_datastore_id,
+                "target_datastore_id": payload.target_datastore_id,
+                "error": "unexpected_error",
+            },
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1467,14 +1862,38 @@ async def api_get_task_status(request: Request, task_id: str) -> dict[str, Any]:
     try:
         payload = await get_task_status(client, task_id)
         if not payload.get("found", False):
+            _record_operation_event(
+                request,
+                action="task_status_query",
+                status_text="not_found",
+                details={"task_id": task_id},
+            )
             raise HTTPException(status_code=404, detail="Task não encontrada.")
+        _record_operation_event(
+            request,
+            action="task_status_query",
+            status_text="ok",
+            details={"task_id": task_id, "state": payload.get("state"), "found": True},
+        )
         return payload
     except HTTPException:
         raise
     except VCenterClientError as exc:
+        _record_operation_event(
+            request,
+            action="task_status_query",
+            status_text="error",
+            details={"task_id": task_id, "error": str(exc)},
+        )
         raise _map_vcenter_error(exc)
     except Exception:
         logger.exception("Erro inesperado ao consultar status da task %s", task_id)
+        _record_operation_event(
+            request,
+            action="task_status_query",
+            status_text="error",
+            details={"task_id": task_id, "error": "unexpected_error"},
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Erro inesperado ao consultar status da task.",
@@ -1742,6 +2161,12 @@ async def api_cluster_risk(request: Request, cluster_id: str) -> ClusterRiskResp
     description="Stub seguro para futura aplicação manual de recomendações do Storage DRS.",
 )
 async def api_apply_recommendation(request: Request, cluster_id: str, key: str) -> dict[str, Any]:
+    _record_operation_event(
+        request,
+        action="recommendation_apply",
+        status_text="blocked",
+        details={"cluster_id": cluster_id, "key": key, "reason": "operation_blocked_by_policy"},
+    )
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Operação bloqueada por política de segurança. Esta aplicação não aplica/dispensa recomendações.",
@@ -1755,6 +2180,12 @@ async def api_apply_recommendation(request: Request, cluster_id: str, key: str) 
     description="Stub seguro para futura dispensa manual de recomendações do Storage DRS.",
 )
 async def api_dismiss_recommendation(request: Request, cluster_id: str, key: str) -> dict[str, Any]:
+    _record_operation_event(
+        request,
+        action="recommendation_dismiss",
+        status_text="blocked",
+        details={"cluster_id": cluster_id, "key": key, "reason": "operation_blocked_by_policy"},
+    )
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Operação bloqueada por política de segurança. Esta aplicação não aplica/dispensa recomendações.",
