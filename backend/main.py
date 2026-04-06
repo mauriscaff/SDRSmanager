@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import ctypes
 import json
 import logging
 import os
 import threading
 from contextlib import asynccontextmanager
+from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -109,6 +112,10 @@ def _parse_csv_env(name: str, default: list[str]) -> list[str]:
     return normalized or list(default)
 
 
+def _normalize_host(value: str | None) -> str:
+    return (value or "").strip().replace("https://", "").replace("http://", "").rstrip("/")
+
+
 READ_ONLY_MODE = _parse_bool_env("READ_ONLY_MODE", default=True)
 HISTORY_RETENTION_HOURS = max(24, _parse_int_env("ANALYTICS_HISTORY_RETENTION_HOURS", 24 * 30))
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -116,11 +123,28 @@ AUDIT_HISTORY_MAX_ITEMS = max(100, _parse_int_env("AUDIT_HISTORY_MAX_ITEMS", 500
 AUDIT_HISTORY_FILE = Path(
     (os.getenv("AUDIT_HISTORY_FILE") or str(ROOT_DIR / ".runtime" / "operation_history.jsonl")).strip()
 )
+RUNTIME_CONFIG_FILE = Path(
+    (os.getenv("RUNTIME_CONFIG_FILE") or str(ROOT_DIR / ".runtime" / "runtime_config.json")).strip()
+)
 _AUDIT_HISTORY_LOCK = threading.RLock()
+_RUNTIME_CONFIG_LOCK = threading.RLock()
+_RUNTIME_SECRET_SCHEME_DPAPI = "dpapi_v1"
+_RUNTIME_SECRET_SCHEME_PLAIN = "plain_v1"
 ALLOW_VM_STORAGE_MOVE = _parse_bool_env("ALLOW_VM_STORAGE_MOVE", default=True)
 WRITE_ADMIN_KEY = (os.getenv("WRITE_ADMIN_KEY") or "").strip()
 READ_ONLY_TOGGLE_KEY = (os.getenv("READ_ONLY_TOGGLE_KEY") or WRITE_ADMIN_KEY or "").strip()
 READ_ONLY_TOGGLE_OPEN = _parse_bool_env("READ_ONLY_TOGGLE_OPEN", default=True)
+HEALTH_INCLUDE_SENSITIVE = _parse_bool_env("HEALTH_INCLUDE_SENSITIVE", default=False)
+VCENTER_MIGRATION_HOST = _normalize_host(os.getenv("VCENTER_MIGRATION_HOST"))
+VCENTER_MIGRATION_USER = (os.getenv("VCENTER_MIGRATION_USER") or "").strip()
+VCENTER_MIGRATION_PASSWORD = os.getenv("VCENTER_MIGRATION_PASSWORD") or ""
+VCENTER_MIGRATION_VERIFY_SSL = _parse_bool_env(
+    "VCENTER_MIGRATION_VERIFY_SSL",
+    default=_parse_bool_env("VCENTER_VERIFY_SSL", default=True),
+)
+VCENTER_MIGRATION_REQUESTED = bool(
+    VCENTER_MIGRATION_HOST or VCENTER_MIGRATION_USER or VCENTER_MIGRATION_PASSWORD
+)
 
 DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:5500",
@@ -145,6 +169,13 @@ class VCenterConfigPayload(BaseModel):
     verify_ssl: bool = True
 
 
+class VCenterMigrationConfigPayload(BaseModel):
+    host: str | None = None
+    user: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+    verify_ssl: bool = True
+
+
 class VmMovePayload(BaseModel):
     target_datastore_id: str = Field(min_length=1)
     source_datastore_id: str | None = None
@@ -159,6 +190,39 @@ async def lifespan(app: FastAPI):
     app.state.vcenter_client = None
     app.state.vcenter_client_error = None
     app.state.vcenter_config = None
+    app.state.vcenter_migration_client = None
+    app.state.vcenter_migration_client_error = None
+    app.state.vcenter_migration_config = None
+    runtime_cfg = _load_runtime_config_from_disk()
+    persisted_migration = _extract_persisted_migration_config(runtime_cfg)
+    migration_host = VCENTER_MIGRATION_HOST
+    migration_user = VCENTER_MIGRATION_USER
+    migration_password = VCENTER_MIGRATION_PASSWORD
+    migration_verify_ssl = VCENTER_MIGRATION_VERIFY_SSL
+    migration_source = "env_migration"
+    if persisted_migration:
+        migration_host = persisted_migration["host"] or migration_host
+        migration_user = persisted_migration["user"]
+        migration_password = persisted_migration["password"]
+        migration_verify_ssl = bool(persisted_migration["verify_ssl"])
+        migration_source = "runtime_persisted"
+        if bool(persisted_migration.get("legacy_plaintext", False)):
+            try:
+                _persist_migration_identity(
+                    host=migration_host,
+                    user=migration_user,
+                    password=migration_password,
+                    verify_ssl=migration_verify_ssl,
+                )
+                logger.info("Migration identity convertida de plaintext para formato protegido em disco.")
+            except Exception:
+                logger.warning(
+                    "Falha ao migrar migration_identity para formato protegido.",
+                    exc_info=True,
+                )
+    app.state.vcenter_migration_requested = bool(
+        migration_host or migration_user or migration_password
+    )
     app.state.secondary_vcenter_warnings = []
     app.state.read_only_mode = READ_ONLY_MODE
     app.state.analytics_history = {"clusters": {}, "datastores": {}}
@@ -181,6 +245,55 @@ async def lifespan(app: FastAPI):
         app.state.vcenter_client_error = "Erro inesperado ao inicializar o cliente do vCenter."
         logger.exception("Falha inesperada ao inicializar VCenterClient")
 
+    if app.state.vcenter_migration_requested:
+        if not migration_user or not migration_password:
+            app.state.vcenter_migration_client_error = (
+                "Configuração de migração incompleta: defina VCENTER_MIGRATION_USER e "
+                "VCENTER_MIGRATION_PASSWORD."
+            )
+            logger.warning(app.state.vcenter_migration_client_error)
+        else:
+            if not migration_host:
+                primary_client = getattr(app.state, "vcenter_client", None)
+                migration_host = _normalize_host(getattr(primary_client, "host", None))
+            if not migration_host:
+                migration_host = _normalize_host(os.getenv("VCENTER_HOST"))
+
+            if not migration_host:
+                app.state.vcenter_migration_client_error = (
+                    "Configuração de migração inválida: host de migração não resolvido."
+                )
+                logger.warning(app.state.vcenter_migration_client_error)
+            else:
+                try:
+                    migration_client = VCenterClient(
+                        host=migration_host,
+                        user=migration_user,
+                        password=migration_password,
+                        verify_ssl=migration_verify_ssl,
+                        load_env_file=False,
+                    )
+                    app.state.vcenter_migration_client = migration_client
+                    app.state.vcenter_migration_config = {
+                        "host": migration_client.host,
+                        "user": migration_client.user,
+                        "verify_ssl": migration_client.verify_ssl,
+                        "source": migration_source,
+                    }
+                    logger.info(
+                        "Cliente dedicado de migração habilitado host=%s user=%s",
+                        migration_client.host,
+                        migration_client.user,
+                    )
+                except VCenterClientError as exc:
+                    app.state.vcenter_migration_client_error = str(exc)
+                    logger.warning("Cliente de migração não inicializado: %s", exc)
+                except Exception:
+                    app.state.vcenter_migration_client_error = (
+                        "Erro inesperado ao inicializar cliente dedicado de migração."
+                    )
+                    logger.exception("Falha inesperada ao inicializar cliente dedicado de migração")
+
     _record_operation_event_app(
         app,
         action="backend_startup",
@@ -188,6 +301,14 @@ async def lifespan(app: FastAPI):
         details={
             "read_only_mode": app.state.read_only_mode,
             "vcenter_initialized": app.state.vcenter_client is not None,
+            "migration_client_requested": bool(getattr(app.state, "vcenter_migration_requested", False)),
+            "migration_client_initialized": app.state.vcenter_migration_client is not None,
+            "migration_identity_source": str(
+                (
+                    getattr(app.state, "vcenter_migration_config", None)
+                    or {}
+                ).get("source", "none")
+            ),
             "history_file": str(_history_file_path()),
         },
     )
@@ -247,6 +368,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Erro ao finalizar VCenterClient no shutdown")
 
+    migration_client = getattr(app.state, "vcenter_migration_client", None)
+    if migration_client is not None:
+        try:
+            await migration_client.close()
+        except Exception:
+            logger.exception("Erro ao finalizar cliente dedicado de migração no shutdown")
+
 
 app = FastAPI(
     title="SDRS Manager API",
@@ -278,6 +406,196 @@ def _json_safe(value: Any) -> Any:
 
 def _history_file_path() -> Path:
     return AUDIT_HISTORY_FILE
+
+
+def _runtime_config_file_path() -> Path:
+    return RUNTIME_CONFIG_FILE
+
+
+def _is_windows_platform() -> bool:
+    return os.name == "nt"
+
+
+if _is_windows_platform():
+    class _DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+def _dpapi_encrypt(raw: bytes) -> bytes:
+    if not _is_windows_platform():
+        raise RuntimeError("DPAPI disponível apenas no Windows.")
+    input_buffer = ctypes.create_string_buffer(raw)
+    input_blob = _DataBlob(
+        len(raw),
+        ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_ubyte)),
+    )
+    output_blob = _DataBlob()
+    description = ctypes.c_wchar_p("MHUB migration identity")
+    ok = ctypes.windll.crypt32.CryptProtectData(
+        ctypes.byref(input_blob),
+        description,
+        None,
+        None,
+        None,
+        0,
+        ctypes.byref(output_blob),
+    )
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        return bytes(ctypes.string_at(output_blob.pbData, output_blob.cbData))
+    finally:
+        ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+
+def _dpapi_decrypt(raw: bytes) -> bytes:
+    if not _is_windows_platform():
+        raise RuntimeError("DPAPI disponível apenas no Windows.")
+    input_buffer = ctypes.create_string_buffer(raw)
+    input_blob = _DataBlob(
+        len(raw),
+        ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_ubyte)),
+    )
+    output_blob = _DataBlob()
+    description = ctypes.c_wchar_p()
+    ok = ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(input_blob),
+        ctypes.byref(description),
+        None,
+        None,
+        None,
+        0,
+        ctypes.byref(output_blob),
+    )
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        return bytes(ctypes.string_at(output_blob.pbData, output_blob.cbData))
+    finally:
+        ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+
+def _protect_runtime_secret(secret: str) -> dict[str, str]:
+    payload = str(secret or "")
+    if _is_windows_platform():
+        encrypted = _dpapi_encrypt(payload.encode("utf-8"))
+        return {
+            "scheme": _RUNTIME_SECRET_SCHEME_DPAPI,
+            "value": base64.b64encode(encrypted).decode("ascii"),
+        }
+    logger.warning(
+        "Plataforma sem DPAPI; credencial persistida com fallback plain_v1. "
+        "Recomendado executar no Windows para proteção em disco."
+    )
+    return {
+        "scheme": _RUNTIME_SECRET_SCHEME_PLAIN,
+        "value": payload,
+    }
+
+
+def _unprotect_runtime_secret(protected: dict[str, Any]) -> str:
+    if not isinstance(protected, dict):
+        return ""
+    scheme = str(protected.get("scheme", "") or "").strip().lower()
+    value = str(protected.get("value", "") or "")
+    if not scheme:
+        return ""
+    if scheme == _RUNTIME_SECRET_SCHEME_DPAPI:
+        decrypted = _dpapi_decrypt(base64.b64decode(value.encode("ascii")))
+        return decrypted.decode("utf-8", errors="strict")
+    if scheme == _RUNTIME_SECRET_SCHEME_PLAIN:
+        return value
+    raise ValueError(f"Esquema de proteção desconhecido: {scheme}")
+
+
+def _load_runtime_config_from_disk() -> dict[str, Any]:
+    path = _runtime_config_file_path()
+    with _RUNTIME_CONFIG_LOCK:
+        if not path.exists():
+            return {}
+        try:
+            raw = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            logger.warning("Falha ao ler runtime config em %s", path, exc_info=True)
+            return {}
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            logger.warning("Runtime config inválido em %s", path, exc_info=True)
+            return {}
+
+        if isinstance(parsed, dict):
+            return parsed
+        return {}
+
+
+def _save_runtime_config_to_disk(payload: dict[str, Any]) -> None:
+    path = _runtime_config_file_path()
+    with _RUNTIME_CONFIG_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_text(
+            json.dumps(_json_safe(payload), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+
+
+def _extract_persisted_migration_config(runtime_cfg: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(runtime_cfg, dict):
+        return None
+    section = runtime_cfg.get("migration_identity")
+    if not isinstance(section, dict):
+        return None
+
+    user = str(section.get("user", "") or "").strip()
+    password = ""
+    legacy_plaintext = False
+
+    protected_password = section.get("password_protected")
+    if isinstance(protected_password, dict):
+        try:
+            password = _unprotect_runtime_secret(protected_password)
+        except Exception:
+            logger.warning(
+                "Falha ao decodificar migration_identity.password_protected; ignorando configuração persistida.",
+                exc_info=True,
+            )
+            return None
+    else:
+        legacy_password = section.get("password")
+        password = str(legacy_password or "")
+        legacy_plaintext = bool(password)
+
+    if not user or not password:
+        return None
+
+    return {
+        "host": _normalize_host(str(section.get("host", "") or "")),
+        "user": user,
+        "password": password,
+        "verify_ssl": bool(section.get("verify_ssl", True)),
+        "legacy_plaintext": legacy_plaintext,
+    }
+
+
+def _persist_migration_identity(
+    *,
+    host: str,
+    user: str,
+    password: str,
+    verify_ssl: bool,
+) -> None:
+    cfg = _load_runtime_config_from_disk()
+    cfg["migration_identity"] = {
+        "host": _normalize_host(host),
+        "user": str(user or "").strip(),
+        "password_protected": _protect_runtime_secret(str(password or "")),
+        "verify_ssl": bool(verify_ssl),
+        "updated_at": _utc_now().isoformat(),
+    }
+    _save_runtime_config_to_disk(cfg)
 
 
 def _load_audit_history_from_disk(max_items: int) -> list[dict[str, Any]]:
@@ -364,6 +682,83 @@ def _record_operation_event_app(
     return entry
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _compute_task_duration_seconds(task_payload: dict[str, Any]) -> float | None:
+    start_time = _parse_iso_datetime(task_payload.get("start_time"))
+    complete_time = _parse_iso_datetime(task_payload.get("complete_time"))
+    queue_time = _parse_iso_datetime(task_payload.get("queue_time"))
+
+    if start_time is not None and complete_time is not None:
+        return round(max((complete_time - start_time).total_seconds(), 0.0), 2)
+    if queue_time is not None and complete_time is not None:
+        return round(max((complete_time - queue_time).total_seconds(), 0.0), 2)
+    if start_time is not None:
+        return round(max((_utc_now() - start_time).total_seconds(), 0.0), 2)
+    if queue_time is not None:
+        return round(max((_utc_now() - queue_time).total_seconds(), 0.0), 2)
+    return None
+
+
+def _find_move_context_for_task(app: FastAPI, task_id: str) -> dict[str, Any]:
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return {}
+    history = list(getattr(app.state, "operation_history", []) or [])
+    for item in reversed(history):
+        if str(item.get("action", "")).strip().lower() != "vm_move_request":
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        if str(details.get("task_id", "")).strip() != normalized_task_id:
+            continue
+        return {
+            "source_app": details.get("source_app"),
+            "cluster_id": details.get("cluster_id"),
+            "vm_id": details.get("vm_id"),
+            "vm_name": details.get("vm_name"),
+            "source_datastore_id": details.get("source_datastore_id"),
+            "source_datastore_name": details.get("source_datastore_name"),
+            "target_datastore_id": details.get("target_datastore_id"),
+            "target_datastore_name": details.get("target_datastore_name"),
+        }
+    return {}
+
+
+def _has_vm_move_result_event(app: FastAPI, task_id: str, state_text: str | None = None) -> bool:
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return False
+    normalized_state = str(state_text or "").strip().lower()
+    history = list(getattr(app.state, "operation_history", []) or [])
+    for item in reversed(history):
+        if str(item.get("action", "")).strip().lower() != "vm_move_result":
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        if str(details.get("task_id", "")).strip() != normalized_task_id:
+            continue
+        if normalized_state:
+            current_state = str(details.get("state", "") or item.get("status", "")).strip().lower()
+            if current_state != normalized_state:
+                continue
+        return True
+    return False
+
+
 async def _replace_vcenter_client(
     request: Request,
     new_client: VCenterClient | None,
@@ -387,6 +782,31 @@ async def _replace_vcenter_client(
             logger.exception("Erro ao fechar cliente antigo do vCenter durante troca de configuração")
 
 
+async def _replace_vcenter_migration_client(
+    request: Request,
+    new_client: VCenterClient | None,
+    init_error: str | None,
+    config: dict[str, Any] | None,
+    requested: bool = True,
+) -> None:
+    old_client = getattr(request.app.state, "vcenter_migration_client", None)
+
+    request.app.state.vcenter_migration_client = new_client
+    request.app.state.vcenter_migration_client_error = init_error
+    request.app.state.vcenter_migration_config = config
+    request.app.state.vcenter_migration_requested = bool(requested)
+
+    if old_client is not None:
+        try:
+            _invalidate_si(old_client)
+        except Exception:
+            pass
+        try:
+            await old_client.close()
+        except Exception:
+            logger.exception("Erro ao fechar cliente antigo de migração durante troca de configuração")
+
+
 def _is_read_only_mode(request: Request) -> bool:
     return bool(getattr(request.app.state, "read_only_mode", True))
 
@@ -402,6 +822,8 @@ def _get_move_guardrails() -> dict[str, Any]:
 
 def _get_safety_policy(request: Request) -> dict[str, Any]:
     read_only_toggle_key_required = (not READ_ONLY_TOGGLE_OPEN) and bool(READ_ONLY_TOGGLE_KEY)
+    migration_requested = bool(getattr(request.app.state, "vcenter_migration_requested", False))
+    migration_active = getattr(request.app.state, "vcenter_migration_client", None) is not None
     return {
         "read_only_mode": _is_read_only_mode(request),
         "allow_vm_storage_move": ALLOW_VM_STORAGE_MOVE,
@@ -409,6 +831,8 @@ def _get_safety_policy(request: Request) -> dict[str, Any]:
         "read_only_toggle_key_required": read_only_toggle_key_required,
         "read_only_toggle_open": READ_ONLY_TOGGLE_OPEN,
         "operation_history_enabled": True,
+        "separate_migration_identity_requested": migration_requested,
+        "separate_migration_identity_active": migration_active,
         "move_confirmation_header_required": True,
         "forbid_vm_delete": True,
         "forbid_vm_power_actions": True,
@@ -421,7 +845,15 @@ def _get_safety_policy(request: Request) -> dict[str, Any]:
 
 def _require_admin_key_if_configured(request: Request) -> None:
     if not WRITE_ADMIN_KEY:
-        return
+        if _is_loopback_request(request):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "WRITE_ADMIN_KEY não configurada. "
+                "Operações de escrita sem chave são permitidas apenas em loopback/local."
+            ),
+        )
 
     provided = (request.headers.get("x-admin-key") or "").strip()
     if provided != WRITE_ADMIN_KEY:
@@ -429,6 +861,17 @@ def _require_admin_key_if_configured(request: Request) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Cabeçalho X-Admin-Key ausente ou inválido.",
         )
+
+
+def _mask_sensitive_value(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if HEALTH_INCLUDE_SENSITIVE:
+        return raw
+    if len(raw) <= 2:
+        return "*" * len(raw)
+    return f"{raw[:2]}***"
 
 
 def _is_loopback_request(request: Request) -> bool:
@@ -494,6 +937,23 @@ def get_vcenter_client(request: Request) -> VCenterClient:
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail=detail,
     )
+
+
+def get_vcenter_client_for_write(request: Request) -> VCenterClient:
+    migration_client = getattr(request.app.state, "vcenter_migration_client", None)
+    if migration_client is not None:
+        return migration_client
+
+    migration_requested = bool(getattr(request.app.state, "vcenter_migration_requested", False))
+    if migration_requested:
+        migration_error = getattr(request.app.state, "vcenter_migration_client_error", None)
+        detail = migration_error or "Cliente dedicado de migração não está disponível."
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=detail,
+        )
+
+    return get_vcenter_client(request)
 
 
 def _map_vcenter_error(exc: VCenterClientError) -> HTTPException:
@@ -1122,6 +1582,283 @@ def _build_cluster_risk(
     )
 
 
+def _policy_rule(
+    rule_id: str,
+    category: str,
+    status_text: str,
+    title: str,
+    description: str,
+    evidence: dict[str, Any] | None = None,
+    remediation: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "rule_id": rule_id,
+        "category": category,
+        "status": status_text,
+        "title": title,
+        "description": description,
+        "evidence": evidence or {},
+        "remediation": remediation,
+    }
+
+
+def _build_sdrs_policy_matrix(
+    summary: dict[str, Any],
+    detail: dict[str, Any],
+    config: ClusterConfig,
+    derived: ClusterDerivedDetail,
+    metrics: DatastoreMetricsResponse,
+    pending_payload: PendingRecommendationsResponse,
+) -> dict[str, Any]:
+    datastores = list(detail.get("datastores", []) or [])
+    ds_count = len(datastores)
+    accessible_values = [ds.get("accessible") for ds in datastores if ds.get("accessible") is not None]
+    all_accessible = all(bool(v) for v in accessible_values) if accessible_values else None
+
+    ds_types = sorted(
+        {
+            str(ds.get("datastore_type") or "").strip().upper()
+            for ds in datastores
+            if str(ds.get("datastore_type") or "").strip()
+        }
+    )
+
+    space_mode = str(summary.get("space_threshold_mode") or "").strip().lower()
+    space_utilization_threshold = summary.get("space_utilization_threshold")
+    free_space_threshold = summary.get("free_space_threshold")
+    io_threshold = config.sdrs_latency_threshold_ms
+
+    latency_samples = [item.p90_latency_ms for item in metrics.items if item.p90_latency_ms is not None]
+    latency_sample_count = len(latency_samples)
+    above_latency_count = (
+        len([value for value in latency_samples if io_threshold is not None and value >= io_threshold])
+        if io_threshold is not None
+        else 0
+    )
+    near_space_count = len([item for item in metrics.items if item.above_space_threshold])
+    critical_space_count = len([item for item in metrics.items if item.critical_used_percent])
+
+    mode = "space_io" if (io_threshold is not None and latency_sample_count > 0) else "space_only"
+
+    hard_rules: list[dict[str, Any]] = []
+    hard_rules.append(
+        _policy_rule(
+            "sdrs_enabled",
+            "hard",
+            "pass" if bool(summary.get("sdrs_enabled", False)) else "fail",
+            "SDRS habilitado no datastore cluster",
+            "Storage DRS precisa estar ativo para recomendar placement e rebalanceamento.",
+            evidence={"sdrs_enabled": bool(summary.get("sdrs_enabled", False))},
+            remediation="Ativar Storage DRS no datastore cluster.",
+        )
+    )
+    hard_rules.append(
+        _policy_rule(
+            "datastore_cluster_member_count",
+            "hard",
+            "pass" if ds_count >= 2 else "fail",
+            "Cluster com ao menos 2 datastores",
+            "SDRS requer múltiplos datastores membros para balanceamento.",
+            evidence={"datastore_count": ds_count},
+            remediation="Adicionar datastores membros compatíveis ao cluster.",
+        )
+    )
+    hard_rules.append(
+        _policy_rule(
+            "datastore_accessibility",
+            "hard",
+            "unknown" if all_accessible is None else ("pass" if all_accessible else "fail"),
+            "Datastores acessíveis para os hosts",
+            "Datastores inacessíveis bloqueiam movimentações e recomendações efetivas.",
+            evidence={
+                "known_accessibility_count": len(accessible_values),
+                "all_accessible": all_accessible,
+            },
+            remediation="Corrigir conectividade/visibilidade dos datastores para os hosts do cluster.",
+        )
+    )
+    hard_rules.append(
+        _policy_rule(
+            "homogeneous_datastore_type",
+            "hard",
+            "unknown" if not ds_types else ("pass" if len(ds_types) == 1 else "fail"),
+            "Tipo de datastore homogêneo no cluster",
+            "Boas práticas de SDRS recomendam membros homogêneos por tipo/protocolo.",
+            evidence={"datastore_types": ds_types, "distinct_type_count": len(ds_types)},
+            remediation="Evitar mistura de tipos/protocolos no mesmo datastore cluster.",
+        )
+    )
+
+    if space_mode == "utilization":
+        space_status = "pass" if space_utilization_threshold is not None else "warn"
+    elif space_mode == "freespace":
+        space_status = "pass" if free_space_threshold is not None else "warn"
+    else:
+        space_status = "warn"
+    hard_rules.append(
+        _policy_rule(
+            "space_threshold_configured",
+            "hard",
+            space_status,
+            "Threshold de espaço configurado",
+            "SDRS depende de threshold de espaço para gerar recomendações de balanceamento por capacidade.",
+            evidence={
+                "space_threshold_mode": summary.get("space_threshold_mode"),
+                "space_utilization_threshold": space_utilization_threshold,
+                "free_space_threshold_gb": free_space_threshold,
+            },
+            remediation="Definir threshold de espaço (utilization ou freeSpace) no pod SDRS.",
+        )
+    )
+
+    hard_rules.append(
+        _policy_rule(
+            "io_metric_data_available",
+            "hard",
+            (
+                "pass"
+                if io_threshold is not None and latency_sample_count > 0
+                else ("warn" if io_threshold is None else "fail")
+            ),
+            "Métricas reais de latência I/O disponíveis",
+            "Sem amostra real de latência, o mecanismo opera em modo space-only.",
+            evidence={
+                "io_threshold_ms": io_threshold,
+                "latency_sample_count": latency_sample_count,
+                "datastore_count": ds_count,
+                "datastores_with_latency_sample": latency_sample_count,
+                "datastores_without_latency_sample": max(0, ds_count - latency_sample_count),
+                "latency_observed_ratio": round(
+                    (latency_sample_count / ds_count), 3
+                ) if ds_count > 0 else None,
+            },
+            remediation=(
+                "Garantir coleta de métricas de datastore no vCenter (performance level/permissões), "
+                "ou desabilitar I/O metric para operação explícita space-only."
+            ),
+        )
+    )
+
+    soft_rules: list[dict[str, Any]] = []
+    soft_rules.append(
+        _policy_rule(
+            "automation_level",
+            "soft",
+            "pass" if config.automation_level == "automated" else ("fail" if config.automation_level == "disabled" else "warn"),
+            "Nível de automação SDRS",
+            "Modo manual mantém recomendações, mas aumenta tempo de reação operacional.",
+            evidence={"automation_level": config.automation_level},
+            remediation="Usar automated quando a operação permitir; manter manual em ambientes controlados.",
+        )
+    )
+
+    soft_rules.append(
+        _policy_rule(
+            "space_imbalance",
+            "soft",
+            "pass"
+            if derived.space_imbalance_percent < 10
+            else ("warn" if derived.space_imbalance_percent < 20 else "fail"),
+            "Desequilíbrio de espaço entre datastores",
+            "Desequilíbrio elevado tende a gerar pressão e recomendações mais agressivas.",
+            evidence={
+                "space_imbalance_percent": derived.space_imbalance_percent,
+                "max_used_percent": derived.max_used_percent,
+                "min_used_percent": derived.min_used_percent,
+            },
+        )
+    )
+
+    soft_rules.append(
+        _policy_rule(
+            "space_pressure",
+            "soft",
+            "fail" if critical_space_count > 0 else ("warn" if near_space_count > 0 else "pass"),
+            "Pressão de capacidade no cluster",
+            "Datastores próximos/above threshold aumentam risco operacional.",
+            evidence={
+                "near_space_threshold_count": near_space_count,
+                "critical_used_count": critical_space_count,
+                "space_threshold_percent": config.space_threshold_percent,
+            },
+        )
+    )
+
+    if io_threshold is None:
+        latency_status = "unknown"
+    elif latency_sample_count == 0:
+        latency_status = "warn"
+    else:
+        ratio = above_latency_count / max(1, latency_sample_count)
+        latency_status = "pass" if ratio <= 0.1 else ("warn" if ratio <= 0.3 else "fail")
+
+    soft_rules.append(
+        _policy_rule(
+            "io_latency_pressure",
+            "soft",
+            latency_status,
+            "Pressão de latência no cluster",
+            "Quando há métrica real, mede quantos datastores estão acima do threshold de I/O.",
+            evidence={
+                "io_threshold_ms": io_threshold,
+                "latency_sample_count": latency_sample_count,
+                "above_latency_threshold_count": above_latency_count,
+                "above_latency_ratio": (
+                    round(above_latency_count / latency_sample_count, 3)
+                    if latency_sample_count > 0
+                    else None
+                ),
+            },
+        )
+    )
+
+    soft_rules.append(
+        _policy_rule(
+            "pending_recommendation_mix",
+            "soft",
+            "pass" if pending_payload.summary.pending_count == 0 else "warn",
+            "Fila de recomendações pendentes",
+            "Fila acumulada indica backlog operacional para remediação.",
+            evidence={
+                "pending_count": pending_payload.summary.pending_count,
+                "space_balance_count": pending_payload.summary.space_balance_count,
+                "latency_balance_count": pending_payload.summary.latency_balance_count,
+            },
+        )
+    )
+
+    def _status_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+        return {
+            "pass": len([x for x in items if x.get("status") == "pass"]),
+            "warn": len([x for x in items if x.get("status") == "warn"]),
+            "fail": len([x for x in items if x.get("status") == "fail"]),
+            "unknown": len([x for x in items if x.get("status") == "unknown"]),
+        }
+
+    hard_counts = _status_counts(hard_rules)
+    soft_counts = _status_counts(soft_rules)
+
+    return {
+        "cluster_id": str(summary.get("id", "")),
+        "cluster_name": str(summary.get("name", "unknown")),
+        "collected_at": _utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "mode": mode,
+        "summary": {
+            "hard": hard_counts,
+            "soft": soft_counts,
+        },
+        "hard_rules": hard_rules,
+        "soft_rules": soft_rules,
+        "references": [
+            {"source": "Broadcom KB 320864", "url": "https://knowledge.broadcom.com/external/article/320864/storage-drs-faq.html"},
+            {"source": "Broadcom KB 310161", "url": "https://knowledge.broadcom.com/external/article/310161/enabling-and-disabling-storage-drs-sdrs.html"},
+            {"source": "Broadcom KB 403952", "url": "https://knowledge.broadcom.com/external/article/403952/storage-drs-does-not-generate-recommenda.html"},
+            {"source": "Broadcom KB 432448", "url": "https://knowledge.broadcom.com/external/article/432448/storage-drs-fails-to-balance-vmdks-acros.html"},
+            {"source": "Broadcom KB 397796", "url": "https://knowledge.broadcom.com/external/article/397796/resolving-datastore-is-in-multiple-datac.html"},
+        ],
+    }
+
+
 def _build_cluster_overview_item(
     summary: dict[str, Any],
     config: ClusterConfig,
@@ -1244,14 +1981,23 @@ async def root() -> dict[str, str]:
 async def health(request: Request) -> dict[str, Any]:
     init_error = getattr(request.app.state, "vcenter_client_error", None)
     active_cfg = getattr(request.app.state, "vcenter_config", None) or {}
+    migration_cfg = getattr(request.app.state, "vcenter_migration_config", None) or {}
+    migration_error = getattr(request.app.state, "vcenter_migration_client_error", None)
+    migration_requested = bool(getattr(request.app.state, "vcenter_migration_requested", False))
     secondary_warnings = list(getattr(request.app.state, "secondary_vcenter_warnings", []) or [])
 
     return {
         "status": "ok",
         "service": "sdrs-manager-backend",
         "vcenter": active_cfg.get("host", ""),
+        "vcenter_user": _mask_sensitive_value(active_cfg.get("user", "")),
         "client_initialized": getattr(request.app.state, "vcenter_client", None) is not None,
         "client_init_error": init_error,
+        "migration_vcenter": migration_cfg.get("host", ""),
+        "migration_user": _mask_sensitive_value(migration_cfg.get("user", "")),
+        "migration_client_requested": migration_requested,
+        "migration_client_initialized": getattr(request.app.state, "vcenter_migration_client", None) is not None,
+        "migration_client_error": migration_error,
         "read_only": _is_read_only_mode(request),
         "cors_allow_origins": CORS_ALLOW_ORIGINS,
         "cors_allow_credentials": CORS_ALLOW_CREDENTIALS,
@@ -1311,7 +2057,7 @@ async def operation_history(
     summary="Alterna read-only em runtime",
     description=(
         "Atualiza o modo de segurança read-only em memória (não persiste no .env). "
-        "Exige cabeçalho X-Readonly-Key."
+        "Em modo aberto local, não exige chave. Em modo protegido, exige X-Readonly-Key."
     ),
 )
 async def set_read_only_mode(request: Request, payload: ReadOnlyModePayload) -> dict[str, Any]:
@@ -1412,6 +2158,135 @@ async def get_vcenter_config(request: Request) -> dict[str, Any]:
         "user": cfg.get("user", ""),
         "verify_ssl": bool(cfg.get("verify_ssl", True)),
         "source": cfg.get("source", "runtime"),
+        "client_init_error": init_error,
+    }
+
+
+@app.post(
+    "/api/vcenter/migration-config",
+    tags=["config"],
+    summary="Define configuração de vCenter para migração em runtime",
+    description=(
+        "Configura identidade dedicada para operações de escrita/migração (Storage vMotion). "
+        "Persistido em .runtime/runtime_config.json."
+    ),
+)
+async def set_vcenter_migration_config(
+    request: Request,
+    payload: VCenterMigrationConfigPayload,
+) -> dict[str, Any]:
+    _require_admin_key_if_configured(request)
+
+    raw_host = _normalize_host(payload.host)
+    if not raw_host:
+        primary_cfg = getattr(request.app.state, "vcenter_config", None) or {}
+        raw_host = _normalize_host(str(primary_cfg.get("host", "") or ""))
+
+    if not raw_host:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Host de migração ausente. Informe host ou configure o vCenter principal primeiro.",
+        )
+
+    try:
+        client = VCenterClient(
+            host=raw_host,
+            user=payload.user,
+            password=payload.password,
+            verify_ssl=payload.verify_ssl,
+            load_env_file=False,
+        )
+    except VCenterClientError as exc:
+        _record_operation_event(
+            request,
+            action="vcenter_migration_config_set",
+            status_text="error",
+            details={"host": raw_host, "user": payload.user, "error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    cfg = {
+        "host": client.host,
+        "user": client.user,
+        "verify_ssl": client.verify_ssl,
+        "source": "runtime_persisted",
+    }
+    try:
+        _persist_migration_identity(
+            host=client.host,
+            user=client.user,
+            password=payload.password,
+            verify_ssl=client.verify_ssl,
+        )
+    except Exception as exc:
+        _record_operation_event(
+            request,
+            action="vcenter_migration_config_set",
+            status_text="error",
+            details={
+                "host": client.host,
+                "user": client.user,
+                "verify_ssl": client.verify_ssl,
+                "error": f"persist_failed: {exc}",
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Falha ao persistir configuração de migração em disco.",
+        )
+    await _replace_vcenter_migration_client(request, client, None, cfg, requested=True)
+
+    _record_operation_event(
+        request,
+        action="vcenter_migration_config_set",
+        status_text="ok",
+        details={
+            "host": client.host,
+            "user": client.user,
+            "verify_ssl": client.verify_ssl,
+            "persisted": True,
+            "runtime_config_file": str(_runtime_config_file_path()),
+        },
+    )
+
+    return {
+        "configured": True,
+        **cfg,
+    }
+
+
+@app.get(
+    "/api/vcenter/migration-config",
+    tags=["config"],
+    summary="Lê configuração de vCenter de migração ativa",
+    description="Retorna host/usuário/SSL da identidade de migração atualmente em uso.",
+)
+async def get_vcenter_migration_config(request: Request) -> dict[str, Any]:
+    cfg = getattr(request.app.state, "vcenter_migration_config", None)
+    init_error = getattr(request.app.state, "vcenter_migration_client_error", None)
+    requested = bool(getattr(request.app.state, "vcenter_migration_requested", False))
+
+    if not cfg:
+        return {
+            "configured": False,
+            "requested": requested,
+            "host": "",
+            "user": "",
+            "verify_ssl": True,
+            "source": "none",
+            "client_init_error": init_error,
+        }
+
+    return {
+        "configured": True,
+        "requested": requested,
+        "host": cfg.get("host", ""),
+        "user": cfg.get("user", ""),
+        "verify_ssl": bool(cfg.get("verify_ssl", True)),
+        "source": cfg.get("source", "runtime_persisted"),
         "client_init_error": init_error,
     }
 
@@ -1687,13 +2562,22 @@ async def api_move_vm(
     payload: VmMovePayload,
 ) -> dict[str, Any]:
     _require_admin_key_if_configured(request)
+    raw_source_app = (request.headers.get("x-client-app") or "").strip().lower()
+    source_app = raw_source_app[:64] if raw_source_app else None
+
+    def _details_with_source_app(details: dict[str, Any]) -> dict[str, Any]:
+        if source_app:
+            return {**details, "source_app": source_app}
+        return details
 
     if not ALLOW_VM_STORAGE_MOVE:
         _record_operation_event(
             request,
             action="vm_move_request",
             status_text="blocked",
-            details={"cluster_id": cluster_id, "vm_id": vm_id, "reason": "move_disabled_by_policy"},
+            details=_details_with_source_app(
+                {"cluster_id": cluster_id, "vm_id": vm_id, "reason": "move_disabled_by_policy"}
+            ),
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1705,7 +2589,9 @@ async def api_move_vm(
             request,
             action="vm_move_request",
             status_text="blocked",
-            details={"cluster_id": cluster_id, "vm_id": vm_id, "reason": "read_only_mode"},
+            details=_details_with_source_app(
+                {"cluster_id": cluster_id, "vm_id": vm_id, "reason": "read_only_mode"}
+            ),
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1718,14 +2604,16 @@ async def api_move_vm(
             request,
             action="vm_move_request",
             status_text="blocked",
-            details={"cluster_id": cluster_id, "vm_id": vm_id, "reason": "missing_confirmation_header"},
+            details=_details_with_source_app(
+                {"cluster_id": cluster_id, "vm_id": vm_id, "reason": "missing_confirmation_header"}
+            ),
         )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Confirmação explícita ausente. Envie o cabeçalho X-Confirm-Storage-Move: yes.",
         )
 
-    client = get_vcenter_client(request)
+    client = get_vcenter_client_for_write(request)
     try:
         response = await move_vm_to_datastore(
             client=client,
@@ -1738,13 +2626,20 @@ async def api_move_vm(
             request,
             action="vm_move_request",
             status_text="queued",
-            details={
-                "cluster_id": cluster_id,
-                "vm_id": vm_id,
-                "source_datastore_id": payload.source_datastore_id,
-                "target_datastore_id": payload.target_datastore_id,
-                "task_id": response.get("task_id"),
-            },
+            details=_details_with_source_app(
+                {
+                    "cluster_id": cluster_id,
+                    "vm_id": vm_id,
+                    "vm_name": response.get("vm_name"),
+                    "source_datastore_id": payload.source_datastore_id,
+                    "source_datastore_name": response.get("source_datastore_name"),
+                    "target_datastore_id": payload.target_datastore_id,
+                    "target_datastore_name": response.get("target_datastore_name"),
+                    "task_id": response.get("task_id"),
+                    "vcenter_user": client.user,
+                    "vcenter_host": client.host,
+                }
+            ),
         )
         return response
     except SDRSOperationError as exc:
@@ -1753,13 +2648,17 @@ async def api_move_vm(
             request,
             action="vm_move_request",
             status_text="error",
-            details={
-                "cluster_id": cluster_id,
-                "vm_id": vm_id,
-                "source_datastore_id": payload.source_datastore_id,
-                "target_datastore_id": payload.target_datastore_id,
-                "error": message,
-            },
+            details=_details_with_source_app(
+                {
+                    "cluster_id": cluster_id,
+                    "vm_id": vm_id,
+                    "source_datastore_id": payload.source_datastore_id,
+                    "target_datastore_id": payload.target_datastore_id,
+                    "error": message,
+                    "vcenter_user": client.user,
+                    "vcenter_host": client.host,
+                }
+            ),
         )
         lowered = message.lower()
         if "não encontrado" in lowered:
@@ -1772,13 +2671,17 @@ async def api_move_vm(
             request,
             action="vm_move_request",
             status_text="error",
-            details={
-                "cluster_id": cluster_id,
-                "vm_id": vm_id,
-                "source_datastore_id": payload.source_datastore_id,
-                "target_datastore_id": payload.target_datastore_id,
-                "error": str(exc),
-            },
+            details=_details_with_source_app(
+                {
+                    "cluster_id": cluster_id,
+                    "vm_id": vm_id,
+                    "source_datastore_id": payload.source_datastore_id,
+                    "target_datastore_id": payload.target_datastore_id,
+                    "error": str(exc),
+                    "vcenter_user": client.user,
+                    "vcenter_host": client.host,
+                }
+            ),
         )
         raise _map_vcenter_error(exc)
     except Exception:
@@ -1791,13 +2694,17 @@ async def api_move_vm(
             request,
             action="vm_move_request",
             status_text="error",
-            details={
-                "cluster_id": cluster_id,
-                "vm_id": vm_id,
-                "source_datastore_id": payload.source_datastore_id,
-                "target_datastore_id": payload.target_datastore_id,
-                "error": "unexpected_error",
-            },
+            details=_details_with_source_app(
+                {
+                    "cluster_id": cluster_id,
+                    "vm_id": vm_id,
+                    "source_datastore_id": payload.source_datastore_id,
+                    "target_datastore_id": payload.target_datastore_id,
+                    "error": "unexpected_error",
+                    "vcenter_user": client.user,
+                    "vcenter_host": client.host,
+                }
+            ),
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1858,41 +2765,118 @@ async def api_move_vm_options(
     description="Consulta o status de uma task de migração no vCenter para acompanhamento em tempo real.",
 )
 async def api_get_task_status(request: Request, task_id: str) -> dict[str, Any]:
-    client = get_vcenter_client(request)
+    write_client = get_vcenter_client_for_write(request)
+    read_client = get_vcenter_client(request)
+    clients: list[VCenterClient] = [write_client]
+    if read_client is not write_client:
+        clients.append(read_client)
+
+    last_vcenter_error: VCenterClientError | None = None
+    move_context: dict[str, Any] = {}
+    for key, value in _find_move_context_for_task(request.app, task_id).items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        move_context[key] = value
     try:
-        payload = await get_task_status(client, task_id)
-        if not payload.get("found", False):
+        for client in clients:
+            try:
+                payload = await get_task_status(client, task_id)
+            except VCenterClientError as exc:
+                last_vcenter_error = exc
+                continue
+
+            if payload.get("found", False):
+                normalized_state = str(payload.get("state") or "unknown").strip().lower()
+                duration_seconds = _compute_task_duration_seconds(payload)
+                query_details: dict[str, Any] = {
+                    "task_id": task_id,
+                    "state": payload.get("state"),
+                    "found": True,
+                    "progress": payload.get("progress"),
+                    "queue_time": payload.get("queue_time"),
+                    "start_time": payload.get("start_time"),
+                    "complete_time": payload.get("complete_time"),
+                    "duration_seconds": duration_seconds,
+                    "entity_name": payload.get("entity_name"),
+                    "description": payload.get("description"),
+                    "error": payload.get("error"),
+                    "queried_user": client.user,
+                    "queried_host": client.host,
+                    **move_context,
+                }
+                _record_operation_event(
+                    request,
+                    action="task_status_query",
+                    status_text="ok",
+                    details=query_details,
+                )
+                if normalized_state in {"success", "error"} and not _has_vm_move_result_event(
+                    request.app,
+                    task_id,
+                    normalized_state,
+                ):
+                    _record_operation_event(
+                        request,
+                        action="vm_move_result",
+                        status_text=normalized_state,
+                        details={
+                            "task_id": task_id,
+                            "state": payload.get("state"),
+                            "progress": payload.get("progress"),
+                            "queue_time": payload.get("queue_time"),
+                            "start_time": payload.get("start_time"),
+                            "complete_time": payload.get("complete_time"),
+                            "duration_seconds": duration_seconds,
+                            "entity_name": payload.get("entity_name"),
+                            "description": payload.get("description"),
+                            "error": payload.get("error"),
+                            "queried_user": client.user,
+                            "queried_host": client.host,
+                            **move_context,
+                        },
+                    )
+                return payload
+
+        if last_vcenter_error is not None:
             _record_operation_event(
                 request,
                 action="task_status_query",
-                status_text="not_found",
-                details={"task_id": task_id},
+                status_text="error",
+                details={
+                    "task_id": task_id,
+                    "error": str(last_vcenter_error),
+                    **move_context,
+                },
             )
-            raise HTTPException(status_code=404, detail="Task não encontrada.")
+            raise _map_vcenter_error(last_vcenter_error)
+
         _record_operation_event(
             request,
             action="task_status_query",
-            status_text="ok",
-            details={"task_id": task_id, "state": payload.get("state"), "found": True},
+            status_text="not_found",
+            details={
+                "task_id": task_id,
+                "queried_users": [client.user for client in clients],
+                "queried_hosts": [client.host for client in clients],
+                **move_context,
+            },
         )
-        return payload
+        raise HTTPException(status_code=404, detail="Task não encontrada.")
     except HTTPException:
         raise
-    except VCenterClientError as exc:
-        _record_operation_event(
-            request,
-            action="task_status_query",
-            status_text="error",
-            details={"task_id": task_id, "error": str(exc)},
-        )
-        raise _map_vcenter_error(exc)
     except Exception:
         logger.exception("Erro inesperado ao consultar status da task %s", task_id)
         _record_operation_event(
             request,
             action="task_status_query",
             status_text="error",
-            details={"task_id": task_id, "error": "unexpected_error"},
+            details={
+                "task_id": task_id,
+                "error": "unexpected_error",
+                **move_context,
+            },
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2152,6 +3136,88 @@ async def api_cluster_risk(request: Request, cluster_id: str) -> ClusterRiskResp
     except Exception:
         logger.exception("Erro inesperado ao montar risco do cluster %s", cluster_id)
         raise HTTPException(status_code=500, detail="Erro ao montar visão de risco do cluster.")
+
+
+@app.get(
+    "/api/analytics/clusters/{cluster_id}/policy-matrix",
+    tags=["analytics"],
+    summary="Matriz de políticas SDRS (hard/soft)",
+    description="Avalia regras operacionais do SDRS por cluster e retorna diagnóstico auditável.",
+)
+async def api_cluster_policy_matrix(request: Request, cluster_id: str) -> dict[str, Any]:
+    client = get_vcenter_client(request)
+    try:
+        summary = await _require_cluster_exists(client, cluster_id)
+        detail = await get_cluster_detail(client, cluster_id)
+        if not detail:
+            raise HTTPException(status_code=404, detail="Datastore cluster não encontrado.")
+
+        config = _build_cluster_config(summary, detail)
+        derived = _build_cluster_derived(detail, config)
+        cluster_history = _cluster_history_points(request, cluster_id)
+        derived = _apply_cluster_growth_from_history(derived, cluster_history)
+        history_by_datastore = _datastore_history_map(request, cluster_id)
+        metrics = _build_datastore_metrics(
+            cluster_id,
+            detail,
+            config,
+            history_by_datastore=history_by_datastore,
+        )
+        recs = await get_pending_recommendations(client, cluster_id)
+        pending_payload = _build_pending_recommendations(cluster_id, recs)
+        _capture_cluster_history(
+            request,
+            cluster_id,
+            derived,
+            metrics,
+            pending_payload.summary.pending_count,
+        )
+
+        payload = _build_sdrs_policy_matrix(
+            summary=summary,
+            detail=detail,
+            config=config,
+            derived=derived,
+            metrics=metrics,
+            pending_payload=pending_payload,
+        )
+        _record_operation_event(
+            request,
+            action="policy_matrix_query",
+            status_text="success",
+            details={
+                "cluster_id": cluster_id,
+                "mode": payload.get("mode"),
+                "hard_fail": int(payload.get("summary", {}).get("hard", {}).get("fail", 0)),
+                "soft_fail": int(payload.get("summary", {}).get("soft", {}).get("fail", 0)),
+            },
+        )
+        return payload
+    except HTTPException as exc:
+        _record_operation_event(
+            request,
+            action="policy_matrix_query",
+            status_text="error",
+            details={"cluster_id": cluster_id, "error": str(exc.detail)},
+        )
+        raise
+    except VCenterClientError as exc:
+        _record_operation_event(
+            request,
+            action="policy_matrix_query",
+            status_text="error",
+            details={"cluster_id": cluster_id, "error": str(exc)},
+        )
+        raise _map_vcenter_error(exc)
+    except Exception:
+        logger.exception("Erro inesperado ao montar policy matrix do cluster %s", cluster_id)
+        _record_operation_event(
+            request,
+            action="policy_matrix_query",
+            status_text="error",
+            details={"cluster_id": cluster_id, "error": "unexpected_error"},
+        )
+        raise HTTPException(status_code=500, detail="Erro ao montar matriz de políticas SDRS.")
 
 
 @app.post(

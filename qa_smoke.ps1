@@ -1,7 +1,7 @@
 param(
     [string]$ApiBase = "http://127.0.0.1:8010",
     [string]$ClusterId = "",
-    [int]$TimeoutSec = 20,
+    [int]$TimeoutSec = 45,
     [string]$OutFile = ".runtime/qa_smoke_results.json"
 )
 

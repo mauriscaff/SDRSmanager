@@ -73,9 +73,34 @@
     .thin-scrollbar::-webkit-scrollbar-track {
       background: transparent;
     }
+
+    .mhub-return-btn {
+      position: fixed !important;
+      bottom: 16px !important;
+      right: 14px !important;
+      top: auto !important;
+      left: auto !important;
+      z-index: 2147483647 !important;
+      padding: 11px 15px !important;
+      border-radius: 11px !important;
+      font-weight: 800 !important;
+      font-size: 0.83rem !important;
+      letter-spacing: 0.03em;
+      text-decoration: none !important;
+      color: #082f49 !important;
+      background: linear-gradient(135deg, #7dd3fc, #22d3ee) !important;
+      box-shadow: 0 10px 28px rgba(34, 211, 238, 0.4) !important;
+      border: 1px solid rgba(34, 211, 238, 0.45) !important;
+      backdrop-filter: blur(3px);
+    }
+
+    .mhub-return-btn:hover {
+      filter: brightness(1.06);
+    }
   </style>
 </head>
 <body class="bg-slate-950">
+  <a class="mhub-return-btn" href="http://127.0.0.1:5600/index.html">↩ Return to MHUB</a>
   <div id="app"></div>
 
   <script>
@@ -86,6 +111,7 @@
       theme: "light",
       sidebarOpen: false,
       route: { name: "dashboard", clusterId: null, datastoreId: null },
+      settingsPolicyClusterId: "",
 
       health: null,
       backendReachable: false,
@@ -96,6 +122,7 @@
       clusters: [],
       clustersLoaded: false,
       clusterDetails: {},
+      clusterPolicyMatrix: {},
       clusterRecs: {},
       clusterCandidates: {},
       clusterSimulation: {},
@@ -126,12 +153,33 @@
         targetDatastoreName: "",
         sizeGb: null
       },
+      moveBatch: {
+        selectedVmIds: [],
+        running: false,
+        processed: 0,
+        queued: 0,
+        failed: 0,
+        total: 0
+      },
+      moveBatchConfirm: {
+        open: false,
+        clusterId: "",
+        sourceDatastoreId: "",
+        targetDatastoreId: "",
+        targetDatastoreName: "",
+        vmIds: []
+      },
       moveTask: {
         taskId: "",
         state: "",
         progress: null,
         error: "",
         active: false
+      },
+      migrationTracker: {
+        modalOpen: false,
+        loading: false,
+        items: []
       },
       operationHistory: [],
       readOnlyForm: {
@@ -149,6 +197,7 @@
         allRecommendations: false,
         allCandidates: false,
         clusterDetail: false,
+        clusterPolicyMatrix: false,
         clusterRecommendations: false,
         clusterCandidates: false,
         clusterSimulation: false,
@@ -158,6 +207,7 @@
         taskStatus: false,
         clusterEnhancement: false,
         vcenterConfig: false,
+        vcenterMigrationConfig: false,
         readOnlyToggle: false,
         latencyDiagnostics: false,
         history: false,
@@ -170,6 +220,7 @@
         recommendations: "",
         candidates: "",
         clusterDetail: "",
+        clusterPolicyMatrix: "",
         clusterRecommendations: "",
         clusterCandidates: "",
         clusterSimulation: "",
@@ -178,12 +229,19 @@
         vmMove: "",
         taskStatus: "",
         vcenterConfig: "",
+        vcenterMigrationConfig: "",
         readOnlyToggle: "",
         latencyDiagnostics: "",
         history: ""
       },
 
       vcenterForm: {
+        host: "",
+        user: "",
+        password: "",
+        verify_ssl: true
+      },
+      vcenterMigrationForm: {
         host: "",
         user: "",
         password: "",
@@ -239,11 +297,97 @@
       return `${formatNumber(value, 2)} ms`;
     }
 
+    function formatUs(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      return `${formatNumber(value, 2)} us`;
+    }
+
+    function formatIops(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
+      const num = Number(value);
+      if (num >= 1000) return `${formatNumber(num / 1000, 2)}k`;
+      return formatNumber(num, 2);
+    }
+
+    function formatClusterSpaceThreshold(clusterLike) {
+      const freeGb = clusterLike?.free_space_threshold;
+      if (freeGb !== null && freeGb !== undefined && !Number.isNaN(Number(freeGb))) {
+        return `${formatNumber(freeGb, 0)} GB`;
+      }
+      const utilizationPct = clusterLike?.space_utilization_threshold;
+      if (utilizationPct !== null && utilizationPct !== undefined && !Number.isNaN(Number(utilizationPct))) {
+        return `${formatNumber(utilizationPct, 0)}%`;
+      }
+      return "—";
+    }
+
+    function formatClusterIoThreshold(clusterLike) {
+      const ioMs = clusterLike?.io_latency_threshold;
+      if (ioMs === null || ioMs === undefined || Number.isNaN(Number(ioMs))) return "—";
+      return `${formatNumber(ioMs, 0)} ms`;
+    }
+
+    function datastoreLatencyBadge(datastoreLike, clusterLike) {
+      const latency = datastoreLike?.latency_ms;
+      if (latency !== null && latency !== undefined && !Number.isNaN(Number(latency))) {
+        return statusBadge(formatMs(latency), Number(latency) > 20 ? "amber" : "emerald");
+      }
+      return statusBadge("Sem amostra real", "slate");
+    }
+
     function formatDateTime(value) {
       if (!value) return "—";
       const d = new Date(value);
       if (Number.isNaN(d.getTime())) return String(value);
       return d.toLocaleString();
+    }
+
+    function formatDurationFromSeconds(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "";
+      const total = Math.max(0, Math.round(Number(value)));
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      if (h > 0) return `${h}h ${m}m ${s}s`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    function normalizeSourceApp(value) {
+      return String(value || "").trim().toLowerCase();
+    }
+
+    function normalizeHistoryAction(value) {
+      return String(value || "").trim().toLowerCase();
+    }
+
+    function filterOperationHistoryToClient(entries) {
+      const safeEntries = Array.isArray(entries) ? entries : [];
+      const allowedTaskIds = new Set();
+
+      for (const entry of safeEntries) {
+        const action = normalizeHistoryAction(entry?.action);
+        if (!(action === "vm_move_request" || action === "vm_move_result")) continue;
+        const details = entry?.details && typeof entry.details === "object" ? entry.details : {};
+        if (normalizeSourceApp(details?.source_app) !== CLIENT_APP_ID) continue;
+        const taskId = String(details?.task_id || "").trim();
+        if (taskId) allowedTaskIds.add(taskId);
+      }
+
+      return safeEntries.filter((entry) => {
+        const action = normalizeHistoryAction(entry?.action);
+        const details = entry?.details && typeof entry.details === "object" ? entry.details : {};
+        const sourceApp = normalizeSourceApp(details?.source_app);
+        const taskId = String(details?.task_id || "").trim();
+
+        if (action === "vm_move_request" || action === "vm_move_result") {
+          return sourceApp === CLIENT_APP_ID;
+        }
+        if (action === "task_status_query") {
+          return sourceApp === CLIENT_APP_ID || (taskId && allowedTaskIds.has(taskId));
+        }
+        return true;
+      });
     }
 
     function statusBadge(label, tone = "slate") {
@@ -258,6 +402,51 @@
       };
       const cls = map[tone] || map.slate;
       return `<span class="inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-semibold ${cls}">${escapeHtml(label)}</span>`;
+    }
+
+    function policyStatusBadge(status) {
+      const normalized = String(status || "").toLowerCase();
+      if (normalized === "pass") return statusBadge("Pass", "emerald");
+      if (normalized === "warn") return statusBadge("Warn", "amber");
+      if (normalized === "fail") return statusBadge("Fail", "rose");
+      return statusBadge("Unknown", "slate");
+    }
+
+    function formatEvidenceValue(value) {
+      if (value === null || value === undefined) return "—";
+      if (typeof value === "number" && Number.isFinite(value)) return formatNumber(value, value % 1 === 0 ? 0 : 3);
+      if (typeof value === "boolean") return value ? "true" : "false";
+      if (Array.isArray(value)) return value.length ? value.join(", ") : "[]";
+      if (typeof value === "object") return JSON.stringify(value);
+      return String(value);
+    }
+
+    function renderRuleEvidence(rule, theme) {
+      const evidence = rule?.evidence && typeof rule.evidence === "object" ? rule.evidence : {};
+      const entries = Object.entries(evidence);
+      if (!entries.length && !rule?.remediation) return "";
+
+      return `
+        <div class="mt-3 space-y-2">
+          ${
+            entries.length
+              ? `<div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                  ${entries.map(([key, value]) => `
+                    <div class="rounded-xl border ${theme.rowBorder} px-2 py-1.5">
+                      <span class="${theme.subtle}">${escapeHtml(key)}:</span>
+                      <span class="font-semibold"> ${escapeHtml(formatEvidenceValue(value))}</span>
+                    </div>
+                  `).join("")}
+                </div>`
+              : ""
+          }
+          ${
+            rule?.remediation
+              ? `<div class="text-xs ${theme.subtle}"><span class="font-semibold">Ação:</span> ${escapeHtml(rule.remediation)}</div>`
+              : ""
+          }
+        </div>
+      `;
     }
 
     function getConnectionBadge() {
@@ -380,6 +569,13 @@
     }
 
     let moveTaskPollTimer = null;
+    let migrationTrackerPollTimer = null;
+    const CLIENT_APP_ID = "sdrs-manager-frontend";
+    const MIGRATION_TRACKER_STORAGE_KEY = "sdrs_migration_tracker_v2";
+    const MIGRATION_TRACKER_LEGACY_STORAGE_KEYS = ["sdrs_migration_tracker_v1"];
+    const MIGRATION_TRACKER_MAX_ITEMS = 80;
+    const ENABLE_HISTORY_MIGRATION_BOOTSTRAP = false;
+    const ENABLE_BACKGROUND_UI_POLLING = false;
 
     function getApiBaseCandidates() {
       const primary = String(state.apiBase || "").replace(/\/+$/, "");
@@ -575,7 +771,7 @@
         });
 
         state.vcenterForm.password = "";
-        await Promise.all([loadHealth(true), connectVcenter(false)]);
+        await Promise.all([loadHealth(true), connectVcenter(false), loadVcenterMigrationConfig(true)]);
         if (showSuccessToast) showToast("Configuração de vCenter salva em runtime.", "success");
       } catch (error) {
         const friendly = String(error.message).includes("404")
@@ -585,6 +781,77 @@
         showToast(friendly, "error");
       } finally {
         state.loading.vcenterConfig = false;
+        render();
+      }
+    }
+
+    async function loadVcenterMigrationConfig(force = false) {
+      if (state.loading.vcenterMigrationConfig && !force) return;
+
+      state.loading.vcenterMigrationConfig = true;
+      state.errors.vcenterMigrationConfig = "";
+      render();
+
+      try {
+        const data = await apiFetch("/api/vcenter/migration-config");
+        if (data?.configured) {
+          state.vcenterMigrationForm.host = data.host || "";
+          state.vcenterMigrationForm.user = data.user || "";
+          state.vcenterMigrationForm.password = "";
+          state.vcenterMigrationForm.verify_ssl = data.verify_ssl !== false;
+        } else {
+          state.vcenterMigrationForm.host = data?.host || state.vcenterForm.host || "";
+          state.vcenterMigrationForm.user = "";
+          state.vcenterMigrationForm.password = "";
+          state.vcenterMigrationForm.verify_ssl = data?.verify_ssl !== false;
+        }
+      } catch (error) {
+        state.errors.vcenterMigrationConfig = String(error.message).includes("404")
+          ? "Backend sem suporte à configuração de migração. Reinicie o backend com a versão atual."
+          : error.message;
+      } finally {
+        state.loading.vcenterMigrationConfig = false;
+        render();
+      }
+    }
+
+    async function saveVcenterMigrationConfig(showSuccessToast = true) {
+      const hostRaw = String(state.vcenterMigrationForm.host || "").trim();
+      const user = String(state.vcenterMigrationForm.user || "").trim();
+      const password = String(state.vcenterMigrationForm.password || "");
+      const verify_ssl = !!state.vcenterMigrationForm.verify_ssl;
+
+      if (!user || !password) {
+        showToast("Preencha usuário e senha do vCenter de migração.", "error");
+        return;
+      }
+
+      state.loading.vcenterMigrationConfig = true;
+      state.errors.vcenterMigrationConfig = "";
+      render();
+
+      try {
+        await apiFetch("/api/vcenter/migration-config", {
+          method: "POST",
+          body: {
+            host: hostRaw || null,
+            user,
+            password,
+            verify_ssl
+          }
+        });
+
+        state.vcenterMigrationForm.password = "";
+        await Promise.all([loadHealth(true), connectVcenter(false), loadVcenterMigrationConfig(true)]);
+        if (showSuccessToast) showToast("Configuração de migração salva em runtime.", "success");
+      } catch (error) {
+        const friendly = String(error.message).includes("404")
+          ? "Backend desatualizado: reinicie para habilitar /api/vcenter/migration-config."
+          : error.message;
+        state.errors.vcenterMigrationConfig = friendly;
+        showToast(friendly, "error");
+      } finally {
+        state.loading.vcenterMigrationConfig = false;
         render();
       }
     }
@@ -673,7 +940,9 @@
 
       try {
         const payload = await apiFetch(`/api/history?limit=${encodeURIComponent(limit)}`);
-        state.operationHistory = Array.isArray(payload?.items) ? payload.items : [];
+        state.operationHistory = filterOperationHistoryToClient(
+          Array.isArray(payload?.items) ? payload.items : []
+        );
       } catch (error) {
         state.errors.history = error.message;
       } finally {
@@ -724,6 +993,29 @@
         if (!state.clusterDetails[clusterId]) state.clusterDetails[clusterId] = null;
       } finally {
         state.loading.clusterDetail = false;
+        render();
+      }
+    }
+
+    async function loadClusterPolicyMatrix(clusterId, force = false) {
+      if (!clusterId) return;
+      if (state.loading.clusterPolicyMatrix && !force) return;
+      if (state.clusterPolicyMatrix[clusterId] && !force) return;
+
+      state.loading.clusterPolicyMatrix = true;
+      state.errors.clusterPolicyMatrix = "";
+      render();
+
+      try {
+        const payload = await apiFetch(`/api/analytics/clusters/${encodeURIComponent(clusterId)}/policy-matrix`);
+        state.clusterPolicyMatrix[clusterId] = payload || null;
+        state.connected = true;
+        state.backendReachable = true;
+      } catch (error) {
+        state.errors.clusterPolicyMatrix = error.message;
+        if (!state.clusterPolicyMatrix[clusterId]) state.clusterPolicyMatrix[clusterId] = null;
+      } finally {
+        state.loading.clusterPolicyMatrix = false;
         render();
       }
     }
@@ -824,6 +1116,7 @@
           ...(payload || {}),
           items: Array.isArray(payload?.items) ? payload.items : []
         };
+        syncBatchSelectionWithDatastore(clusterId, datastoreId);
         state.connected = true;
         state.backendReachable = true;
       } catch (error) {
@@ -876,6 +1169,98 @@
       const items = state.datastoreVms[key]?.items;
       if (!Array.isArray(items)) return null;
       return items.find((vm) => vm.vm_id === vmId) || null;
+    }
+
+    function isOpaqueMoRef(value, prefix) {
+      const text = String(value || "").trim().toLowerCase();
+      if (!text) return false;
+      return new RegExp(`^${prefix}-\\d+$`).test(text);
+    }
+
+    function resolveClusterDisplayNameForTracker(item) {
+      const clusterId = String(item?.clusterId || "").trim();
+      if (!clusterId) return "";
+      const detailName = state.clusterDetails?.[clusterId]?.name;
+      if (detailName) return String(detailName);
+      const fromList = (state.clusters || []).find((cluster) => String(cluster?.id || "") === clusterId);
+      if (fromList?.name) return String(fromList.name);
+      return clusterId;
+    }
+
+    function findVmNameInClusterCache(clusterId, vmId) {
+      const normalizedClusterId = String(clusterId || "").trim();
+      const normalizedVmId = String(vmId || "").trim();
+      if (!normalizedClusterId || !normalizedVmId) return "";
+      const prefix = `${normalizedClusterId}::`;
+      for (const [key, payload] of Object.entries(state.datastoreVms || {})) {
+        if (!String(key).startsWith(prefix)) continue;
+        const items = Array.isArray(payload?.items) ? payload.items : [];
+        const found = items.find((vm) => String(vm?.vm_id || "") === normalizedVmId);
+        if (found?.vm_name) return String(found.vm_name);
+      }
+      return "";
+    }
+
+    function resolveVmDisplayNameForTracker(item) {
+      const vmId = String(item?.vmId || "").trim();
+      const vmName = String(item?.vmName || "").trim();
+      const entityName = String(item?.entityName || "").trim();
+      if (vmName && !(vmId && vmName === vmId)) return vmName;
+      if (entityName && !(vmId && entityName === vmId)) return entityName;
+      const cached = findVmNameInClusterCache(item?.clusterId, vmId);
+      if (cached && !(vmId && cached === vmId)) return cached;
+      if (vmName) return vmName;
+      if (entityName) return entityName;
+      return vmId || "VM não identificada";
+    }
+
+    function resolveDatastoreDisplayNameForTracker(clusterId, datastoreId, datastoreName) {
+      const explicitName = String(datastoreName || "").trim();
+      const explicitId = String(datastoreId || "").trim();
+      if (explicitName && !isOpaqueMoRef(explicitName, "datastore")) return explicitName;
+      const cluster = String(clusterId || "").trim();
+      if (cluster && explicitId) {
+        const ds = findDatastoreById(cluster, explicitId);
+        if (ds?.name) return String(ds.name);
+      }
+      if (explicitName) return explicitName;
+      return explicitId || "—";
+    }
+
+    function getDatastoreVms(clusterId, datastoreId) {
+      const key = datastoreKey(clusterId, datastoreId);
+      const payload = state.datastoreVms[key] || { items: [] };
+      return Array.isArray(payload.items) ? payload.items : [];
+    }
+
+    function getSelectedVmIdsForCurrentDatastore(clusterId, datastoreId) {
+      const vmIdSet = new Set(getDatastoreVms(clusterId, datastoreId).map((vm) => String(vm.vm_id || "")));
+      return (state.moveBatch.selectedVmIds || []).filter((vmId) => vmIdSet.has(String(vmId || "")));
+    }
+
+    function syncBatchSelectionWithDatastore(clusterId, datastoreId) {
+      const valid = getSelectedVmIdsForCurrentDatastore(clusterId, datastoreId);
+      state.moveBatch.selectedVmIds = valid;
+    }
+
+    function setBatchVmSelection(vmId, selected) {
+      const normalizedVmId = String(vmId || "").trim();
+      if (!normalizedVmId) return;
+      const current = new Set(state.moveBatch.selectedVmIds || []);
+      if (selected) {
+        current.add(normalizedVmId);
+      } else {
+        current.delete(normalizedVmId);
+      }
+      state.moveBatch.selectedVmIds = Array.from(current);
+    }
+
+    function clearBatchSelection() {
+      state.moveBatch.selectedVmIds = [];
+      state.moveBatch.processed = 0;
+      state.moveBatch.queued = 0;
+      state.moveBatch.failed = 0;
+      state.moveBatch.total = 0;
     }
 
     function getMoveOptionsForForm(clusterId, sourceDatastoreId, vmId) {
@@ -979,6 +1364,343 @@
       }
     }
 
+    function nowIso() {
+      return new Date().toISOString();
+    }
+
+    function normalizeTaskState(value) {
+      const normalized = String(value || "unknown").toLowerCase();
+      return normalized || "unknown";
+    }
+
+    function isTerminalTaskState(value) {
+      const normalized = normalizeTaskState(value);
+      return normalized === "success" || normalized === "error";
+    }
+
+    function safeProgress(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return null;
+      return Math.max(0, Math.min(100, Number(value)));
+    }
+
+    function estimateTaskEtaIso(item) {
+      if (!item || isTerminalTaskState(item.state)) {
+        return item?.completeTime || null;
+      }
+
+      const progress = safeProgress(item.progress);
+      if (progress === null || progress <= 0 || progress >= 100) return null;
+
+      const startRef = item.startTime || item.queueTime || item.createdAt;
+      const startMs = Date.parse(startRef || "");
+      if (!Number.isFinite(startMs)) return null;
+
+      const nowMs = Date.now();
+      const elapsedMs = nowMs - startMs;
+      if (!Number.isFinite(elapsedMs) || elapsedMs < 5000) return null;
+
+      const estimatedTotalMs = elapsedMs / (progress / 100);
+      if (!Number.isFinite(estimatedTotalMs) || estimatedTotalMs <= 0) return null;
+
+      const etaMs = startMs + estimatedTotalMs;
+      if (!Number.isFinite(etaMs) || etaMs <= nowMs) return null;
+
+      return new Date(etaMs).toISOString();
+    }
+
+    function normalizeTrackerItem(item) {
+      const normalizedState = normalizeTaskState(item?.state);
+      const progress = safeProgress(item?.progress);
+      const normalizedError = String(item?.error || "");
+      const normalized = {
+        taskId: String(item?.taskId || ""),
+        createdByUi: item?.createdByUi === true,
+        sourceApp: String(item?.sourceApp || ""),
+        clusterId: String(item?.clusterId || ""),
+        vmId: String(item?.vmId || ""),
+        vmName: String(item?.vmName || ""),
+        sourceDatastoreId: String(item?.sourceDatastoreId || ""),
+        sourceDatastoreName: String(item?.sourceDatastoreName || ""),
+        targetDatastoreId: String(item?.targetDatastoreId || ""),
+        targetDatastoreName: String(item?.targetDatastoreName || ""),
+        state: normalizedState,
+        progress,
+        error: normalizedError,
+        description: String(item?.description || ""),
+        entityName: String(item?.entityName || ""),
+        queueTime: item?.queueTime || null,
+        startTime: item?.startTime || null,
+        completeTime: item?.completeTime || null,
+        createdAt: item?.createdAt || nowIso(),
+        updatedAt: item?.updatedAt || nowIso(),
+        active: item?.active === undefined ? !isTerminalTaskState(normalizedState) : Boolean(item.active),
+        etaIso: item?.etaIso || null
+      };
+
+      const lowerError = normalized.error.trim().toLowerCase();
+      if (
+        lowerError &&
+        (normalized.state === "queued" || normalized.state === "running") &&
+        (lowerError.includes("task não encontrada") || lowerError.includes("task nao encontrada") || lowerError.includes("task not found"))
+      ) {
+        normalized.state = "error";
+        normalized.active = false;
+      }
+
+      if (!normalized.vmName && normalized.entityName) {
+        normalized.vmName = normalized.entityName;
+      }
+      if (normalized.active && isTerminalTaskState(normalized.state)) {
+        normalized.active = false;
+      }
+      normalized.etaIso = estimateTaskEtaIso(normalized);
+      return normalized;
+    }
+
+    function saveMigrationTrackerToStorage() {
+      try {
+        const payload = {
+          items: (state.migrationTracker.items || []).slice(0, MIGRATION_TRACKER_MAX_ITEMS)
+        };
+        window.localStorage.setItem(MIGRATION_TRACKER_STORAGE_KEY, JSON.stringify(payload));
+      } catch (error) {
+        console.warn("Falha ao salvar migration tracker:", error);
+      }
+    }
+
+    function loadMigrationTrackerFromStorage() {
+      try {
+        for (const legacyKey of MIGRATION_TRACKER_LEGACY_STORAGE_KEYS) {
+          try { window.localStorage.removeItem(legacyKey); } catch (error) {}
+        }
+        const raw = window.localStorage.getItem(MIGRATION_TRACKER_STORAGE_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        const items = Array.isArray(parsed?.items) ? parsed.items : [];
+        state.migrationTracker.items = items
+          .map(normalizeTrackerItem)
+          .filter(item => item.taskId)
+          .filter(item => item.createdByUi === true)
+          .filter(item => item.sourceApp === CLIENT_APP_ID)
+          .slice(0, MIGRATION_TRACKER_MAX_ITEMS);
+      } catch (error) {
+        console.warn("Falha ao carregar migration tracker:", error);
+        state.migrationTracker.items = [];
+      }
+    }
+
+    function upsertMigrationTrackerItem(itemLike) {
+      const item = normalizeTrackerItem(itemLike);
+      if (!item.taskId) return;
+
+      const items = state.migrationTracker.items || [];
+      const index = items.findIndex(current => current.taskId === item.taskId);
+      if (index >= 0) {
+        items[index] = normalizeTrackerItem({ ...items[index], ...item, updatedAt: nowIso() });
+      } else {
+        items.unshift(normalizeTrackerItem(item));
+      }
+
+      state.migrationTracker.items = items
+        .sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0))
+        .slice(0, MIGRATION_TRACKER_MAX_ITEMS);
+      saveMigrationTrackerToStorage();
+    }
+
+    function getMigrationTrackerItem(taskId) {
+      return (state.migrationTracker.items || []).find(item => item.taskId === taskId) || null;
+    }
+
+    function getActiveMigrationCount() {
+      return (state.migrationTracker.items || []).filter(
+        item => item.active && item.sourceApp === CLIENT_APP_ID
+      ).length;
+    }
+
+    function mergeTaskPayloadIntoMigrationTracker(taskId, payload, context = {}) {
+      if (!taskId) return;
+      const current = getMigrationTrackerItem(taskId) || {};
+      const normalizedState = normalizeTaskState(payload?.state || current.state || "unknown");
+      const merged = {
+        ...current,
+        taskId,
+        createdByUi: current.createdByUi === true || context.createdByUi === true,
+        sourceApp: context.sourceApp || current.sourceApp || CLIENT_APP_ID,
+        clusterId: context.clusterId || current.clusterId || "",
+        vmId: context.vmId || current.vmId || "",
+        vmName: context.vmName || current.vmName || payload?.entity_name || current.entityName || "",
+        sourceDatastoreId: context.sourceDatastoreId || current.sourceDatastoreId || "",
+        sourceDatastoreName: context.sourceDatastoreName || current.sourceDatastoreName || "",
+        targetDatastoreId: context.targetDatastoreId || current.targetDatastoreId || "",
+        targetDatastoreName: context.targetDatastoreName || current.targetDatastoreName || "",
+        state: normalizedState,
+        progress: safeProgress(payload?.progress ?? current.progress),
+        error: payload?.error || "",
+        description: payload?.description || current.description || "",
+        entityName: payload?.entity_name || current.entityName || "",
+        queueTime: payload?.queue_time || current.queueTime || null,
+        startTime: payload?.start_time || current.startTime || null,
+        completeTime: payload?.complete_time || current.completeTime || null,
+        createdAt: current.createdAt || nowIso(),
+        updatedAt: nowIso(),
+        active: !isTerminalTaskState(normalizedState)
+      };
+      upsertMigrationTrackerItem(merged);
+    }
+
+    function registerMigrationTaskFromMoveResponse(data, context = {}) {
+      const taskId = String(data?.task_id || "");
+      if (!taskId) return;
+
+      const trackerItem = {
+        taskId,
+        createdByUi: true,
+        sourceApp: CLIENT_APP_ID,
+        clusterId: context.clusterId || "",
+        vmId: data?.vm_id || context.vmId || "",
+        vmName: data?.vm_name || context.vmName || "",
+        sourceDatastoreId: data?.source_datastore_id || context.sourceDatastoreId || "",
+        sourceDatastoreName: data?.source_datastore_name || context.sourceDatastoreName || "",
+        targetDatastoreId: data?.target_datastore_id || context.targetDatastoreId || "",
+        targetDatastoreName: data?.target_datastore_name || context.targetDatastoreName || "",
+        state: data?.state || "queued",
+        progress: 0,
+        error: "",
+        description: data?.message || "",
+        queueTime: nowIso(),
+        startTime: null,
+        completeTime: null,
+        createdAt: nowIso(),
+        updatedAt: nowIso(),
+        active: true
+      };
+
+      upsertMigrationTrackerItem(trackerItem);
+      refreshMigrationTrackerTasks(true);
+    }
+
+    async function bootstrapMigrationTrackerFromHistory(limit = 60) {
+      if (!ENABLE_HISTORY_MIGRATION_BOOTSTRAP) return;
+      try {
+        const payload = await apiFetch(
+          `/api/history?action=vm_move_request&status=queued&limit=${encodeURIComponent(limit)}`
+        );
+        const entries = Array.isArray(payload?.items) ? payload.items : [];
+
+        for (const entry of entries) {
+          const details = entry?.details || {};
+          const taskId = String(details?.task_id || "").trim();
+          if (!taskId) continue;
+
+          const sourceApp = String(details?.source_app || "").trim().toLowerCase();
+          if (sourceApp !== CLIENT_APP_ID) continue;
+          const normalizedStatus = normalizeTaskState(entry?.status || "queued");
+          const isError = normalizedStatus === "error";
+          const item = {
+            taskId,
+            sourceApp: sourceApp || "",
+            clusterId: String(details?.cluster_id || ""),
+            vmId: String(details?.vm_id || ""),
+            vmName: "",
+            sourceDatastoreId: String(details?.source_datastore_id || ""),
+            sourceDatastoreName: "",
+            targetDatastoreId: String(details?.target_datastore_id || ""),
+            targetDatastoreName: "",
+            state: isError ? "error" : "queued",
+            progress: isError ? null : 0,
+            error: isError ? String(details?.error || "Falha na requisição de migração.") : "",
+            description: "Recuperada do histórico operacional",
+            createdAt: entry?.ts || nowIso(),
+            updatedAt: entry?.ts || nowIso(),
+            active: !isError
+          };
+
+          upsertMigrationTrackerItem(item);
+        }
+      } catch (error) {
+        console.warn("Falha ao recuperar histórico de migrações:", error);
+      }
+    }
+
+    function stopMigrationTrackerPolling() {
+      if (migrationTrackerPollTimer) {
+        window.clearTimeout(migrationTrackerPollTimer);
+        migrationTrackerPollTimer = null;
+      }
+    }
+
+    function scheduleMigrationTrackerPolling(delayMs = 3000) {
+      stopMigrationTrackerPolling();
+      if (!ENABLE_BACKGROUND_UI_POLLING) return;
+      if (!getActiveMigrationCount()) return;
+      migrationTrackerPollTimer = window.setTimeout(() => {
+        refreshMigrationTrackerTasks();
+      }, delayMs);
+    }
+
+    async function refreshMigrationTrackerTasks(force = false) {
+      const activeItems = (state.migrationTracker.items || []).filter(
+        item => item.active && item.taskId && item.sourceApp === CLIENT_APP_ID
+      );
+      if (!activeItems.length) {
+        state.migrationTracker.loading = false;
+        stopMigrationTrackerPolling();
+        return;
+      }
+      if (state.migrationTracker.loading && !force) return;
+
+      state.migrationTracker.loading = true;
+      render();
+
+      const results = await Promise.allSettled(
+        activeItems.map(async (item) => {
+          const payload = await apiFetch(`/api/tasks/${encodeURIComponent(item.taskId)}`);
+          return { item, payload };
+        })
+      );
+
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          const { item, payload } = result.value;
+          if (payload?.found === false) {
+            upsertMigrationTrackerItem({
+              ...item,
+              state: "error",
+              active: false,
+              error: "Task não encontrada no vCenter.",
+              updatedAt: nowIso()
+            });
+            continue;
+          }
+          mergeTaskPayloadIntoMigrationTracker(item.taskId, payload, item);
+          continue;
+        }
+
+        const reasonMessage = String(result.reason?.message || "Falha ao consultar task.");
+        const hintedTask = activeItems[results.indexOf(result)];
+        if (!hintedTask?.taskId) continue;
+        upsertMigrationTrackerItem({
+          ...hintedTask,
+          error: reasonMessage,
+          updatedAt: nowIso()
+        });
+      }
+
+      state.migrationTracker.loading = false;
+      render();
+      scheduleMigrationTrackerPolling(3000);
+    }
+
+    function openMigrationTrackerModal() {
+      state.migrationTracker.modalOpen = true;
+      render();
+    }
+
+    function closeMigrationTrackerModal() {
+      state.migrationTracker.modalOpen = false;
+      render();
+    }
+
     async function pollMoveTask(taskId, clusterId) {
       if (!taskId) return;
 
@@ -995,12 +1717,15 @@
           error: payload?.error || "",
           active: !["success", "error"].includes(String(payload?.state || "").toLowerCase())
         };
+        mergeTaskPayloadIntoMigrationTracker(taskId, payload, { clusterId });
 
         const normalized = String(payload?.state || "").toLowerCase();
         if (normalized === "success") {
           showToast("Migração concluída com sucesso.", "success");
           stopMoveTaskPolling();
+          scheduleMigrationTrackerPolling(1200);
           delete state.clusterDetails[clusterId];
+          delete state.clusterPolicyMatrix[clusterId];
           const ds = state.selectedDatastore;
           if (ds.clusterId && ds.datastoreId) {
             delete state.datastoreVms[datastoreKey(ds.clusterId, ds.datastoreId)];
@@ -1014,15 +1739,19 @@
         } else if (normalized === "error") {
           showToast(payload?.error || "Task de migração falhou.", "error");
           stopMoveTaskPolling();
+          scheduleMigrationTrackerPolling(1200);
         } else {
-          moveTaskPollTimer = window.setTimeout(() => {
-            pollMoveTask(taskId, clusterId);
-          }, 2500);
+          if (ENABLE_BACKGROUND_UI_POLLING) {
+            moveTaskPollTimer = window.setTimeout(() => {
+              pollMoveTask(taskId, clusterId);
+            }, 2500);
+          }
         }
       } catch (error) {
         state.errors.taskStatus = error.message;
         showToast(`Falha ao consultar status da task: ${error.message}`, "error");
         stopMoveTaskPolling();
+        scheduleMigrationTrackerPolling(1800);
       } finally {
         state.loading.taskStatus = false;
         render();
@@ -1233,6 +1962,28 @@
       }
     }
 
+    async function enqueueVmMoveRequest(clusterId, vmId, sourceDatastoreId, targetDatastoreId) {
+      const payload = {
+        target_datastore_id: targetDatastoreId,
+        source_datastore_id: sourceDatastoreId || null
+      };
+      const data = await apiFetch(
+        `/api/clusters/${encodeURIComponent(clusterId)}/vms/${encodeURIComponent(vmId)}/move`,
+        {
+          method: "POST",
+          headers: {
+            "X-Confirm-Storage-Move": "yes",
+            "X-Client-App": CLIENT_APP_ID
+          },
+          body: payload
+        }
+      );
+      return {
+        data,
+        optionsKey: moveVmKey(clusterId, sourceDatastoreId || "", vmId)
+      };
+    }
+
     async function moveVmToDatastore(clusterId, vmId, sourceDatastoreId, targetDatastoreId) {
       if (!clusterId || !vmId || !targetDatastoreId) {
         showToast("Selecione VM e datastore de destino.", "error");
@@ -1251,20 +2002,11 @@
       render();
 
       try {
-        const payload = {
-          target_datastore_id: targetDatastoreId,
-          source_datastore_id: sourceDatastoreId || null
-        };
-        const optionsKey = moveVmKey(clusterId, sourceDatastoreId || "", vmId);
-        const data = await apiFetch(
-          `/api/clusters/${encodeURIComponent(clusterId)}/vms/${encodeURIComponent(vmId)}/move`,
-          {
-            method: "POST",
-            headers: {
-              "X-Confirm-Storage-Move": "yes"
-            },
-            body: payload
-          }
+        const { data, optionsKey } = await enqueueVmMoveRequest(
+          clusterId,
+          vmId,
+          sourceDatastoreId,
+          targetDatastoreId
         );
 
         state.moveConfirm.open = false;
@@ -1275,6 +2017,15 @@
           error: "",
           active: true
         };
+        registerMigrationTaskFromMoveResponse(data, {
+          clusterId,
+          vmId,
+          sourceDatastoreId,
+          targetDatastoreId,
+          vmName: state.moveConfirm.vmName || "",
+          sourceDatastoreName: state.moveConfirm.sourceDatastoreName || findDatastoreById(clusterId, sourceDatastoreId)?.name || "",
+          targetDatastoreName: state.moveConfirm.targetDatastoreName || findDatastoreById(clusterId, targetDatastoreId)?.name || ""
+        });
         showToast(data?.message || "Storage vMotion enfileirada.", "success");
 
         const ds = state.selectedDatastore;
@@ -1288,7 +2039,9 @@
         state.movePreview = null;
 
         delete state.clusterDetails[clusterId];
+        delete state.clusterPolicyMatrix[clusterId];
         await loadClusterDetail(clusterId, true);
+        await loadClusterPolicyMatrix(clusterId, true);
 
         if (data?.task_id) {
           stopMoveTaskPolling();
@@ -1301,6 +2054,140 @@
         state.loading.vmMove = false;
         render();
       }
+    }
+
+    function openBatchMoveConfirmModal() {
+      const clusterId = String(state.moveForm.clusterId || state.selectedDatastore.clusterId || "").trim();
+      const sourceDatastoreId = String(state.moveForm.sourceDatastoreId || state.selectedDatastore.datastoreId || "").trim();
+      const targetDatastoreId = String(state.moveForm.targetDatastoreId || "").trim();
+      const selectedVmIds = getSelectedVmIdsForCurrentDatastore(clusterId, sourceDatastoreId);
+
+      if (!clusterId || !sourceDatastoreId) {
+        showToast("Abra um datastore para usar migração em lote.", "error");
+        return;
+      }
+      if (!selectedVmIds.length) {
+        showToast("Selecione ao menos uma VM na tabela para migração em lote.", "error");
+        return;
+      }
+      if (!targetDatastoreId) {
+        showToast("Selecione o datastore de destino antes de confirmar o lote.", "error");
+        return;
+      }
+      if (isReadOnlyMode()) {
+        showToast("Sistema em read-only: migração em lote bloqueada durante os testes.", "info");
+        return;
+      }
+
+      const targetDatastore = findDatastoreById(clusterId, targetDatastoreId);
+      state.moveBatchConfirm = {
+        open: true,
+        clusterId,
+        sourceDatastoreId,
+        targetDatastoreId,
+        targetDatastoreName: targetDatastore?.name || targetDatastoreId,
+        vmIds: selectedVmIds
+      };
+      render();
+    }
+
+    function closeBatchMoveConfirmModal() {
+      state.moveBatchConfirm.open = false;
+      render();
+    }
+
+    async function moveSelectedVmsToDatastore() {
+      const payload = state.moveBatchConfirm;
+      const clusterId = String(payload.clusterId || "").trim();
+      const sourceDatastoreId = String(payload.sourceDatastoreId || "").trim();
+      const targetDatastoreId = String(payload.targetDatastoreId || "").trim();
+      const vmIds = Array.isArray(payload.vmIds) ? payload.vmIds.map((id) => String(id || "").trim()).filter(Boolean) : [];
+
+      if (!clusterId || !sourceDatastoreId || !targetDatastoreId || !vmIds.length) {
+        showToast("Lote inválido. Reabra a confirmação da migração em lote.", "error");
+        return;
+      }
+      if (state.moveBatch.running) return;
+
+      state.moveBatchConfirm.open = false;
+      state.moveBatch.running = true;
+      state.moveBatch.processed = 0;
+      state.moveBatch.queued = 0;
+      state.moveBatch.failed = 0;
+      state.moveBatch.total = vmIds.length;
+      state.errors.vmMove = "";
+      render();
+
+      const successfulVmIds = new Set();
+      const failedMessages = [];
+
+      for (const vmId of vmIds) {
+        try {
+          const vm = findVmByIdInSelectedDatastore(vmId);
+          const options = await loadMoveOptions(clusterId, sourceDatastoreId, vmId, false);
+          const targetOption = getMoveTargetFromOptions(options, targetDatastoreId);
+          if (targetOption && targetOption.compatible === false) {
+            const reasons = Array.isArray(targetOption.reasons) ? targetOption.reasons.map((reason) => humanizeMoveReason(reason)).join(" | ") : "";
+            throw new Error(`Destino incompatível${reasons ? `: ${reasons}` : ""}`);
+          }
+
+          const { data, optionsKey } = await enqueueVmMoveRequest(
+            clusterId,
+            vmId,
+            sourceDatastoreId,
+            targetDatastoreId
+          );
+          delete state.moveOptionsByVm[optionsKey];
+          registerMigrationTaskFromMoveResponse(data, {
+            clusterId,
+            vmId,
+            sourceDatastoreId,
+            targetDatastoreId,
+            vmName: vm?.vm_name || "",
+            sourceDatastoreName: findDatastoreById(clusterId, sourceDatastoreId)?.name || "",
+            targetDatastoreName: findDatastoreById(clusterId, targetDatastoreId)?.name || ""
+          });
+          state.moveBatch.queued += 1;
+          successfulVmIds.add(vmId);
+        } catch (error) {
+          state.moveBatch.failed += 1;
+          failedMessages.push(`${vmId}: ${error.message}`);
+        } finally {
+          state.moveBatch.processed += 1;
+          render();
+        }
+      }
+
+      state.moveBatch.running = false;
+      state.moveBatch.selectedVmIds = (state.moveBatch.selectedVmIds || []).filter((vmId) => !successfulVmIds.has(vmId));
+      state.moveForm.vmId = "";
+      state.moveForm.targetDatastoreId = "";
+      state.movePreview = null;
+      state.moveConfirm.open = false;
+
+      const ds = state.selectedDatastore;
+      if (ds.clusterId && ds.datastoreId) {
+        delete state.datastoreVms[datastoreKey(ds.clusterId, ds.datastoreId)];
+        await loadDatastoreVms(ds.clusterId, ds.datastoreId, true);
+      }
+      delete state.clusterDetails[clusterId];
+      delete state.clusterPolicyMatrix[clusterId];
+      await Promise.all([
+        loadClusterDetail(clusterId, true),
+        loadClusterPolicyMatrix(clusterId, true)
+      ]);
+
+      if (failedMessages.length) {
+        const preview = failedMessages.slice(0, 3).join(" | ");
+        state.errors.vmMove = `Falhas em ${failedMessages.length} VM(s): ${preview}${failedMessages.length > 3 ? " | ..." : ""}`;
+      }
+
+      showToast(
+        `Lote finalizado: ${state.moveBatch.queued} enfileirada(s), ${state.moveBatch.failed} falha(s).`,
+        state.moveBatch.failed ? "info" : "success"
+      );
+      refreshMigrationTrackerTasks(true);
+      render();
     }
 
     function openApplyModal(clusterId, key, title) {
@@ -1339,6 +2226,8 @@
         error: "",
         active: false
       };
+      state.moveBatchConfirm.open = false;
+      clearBatchSelection();
       state.selectedDatastore = {
         clusterId,
         datastoreId,
@@ -1499,8 +2388,8 @@
                   <td class="px-3 py-2 text-xs font-semibold">${escapeHtml(item.action || "unknown")}</td>
                   <td class="px-3 py-2 text-xs">
                     ${
-                      String(item.status || "").toLowerCase() === "ok"
-                        ? statusBadge("ok", "emerald")
+                      ["ok", "success"].includes(String(item.status || "").toLowerCase())
+                        ? statusBadge(String(item.status || "ok"), "emerald")
                         : String(item.status || "").toLowerCase().includes("error")
                           ? statusBadge(String(item.status || "error"), "rose")
                           : statusBadge(String(item.status || "info"), "amber")
@@ -1520,13 +2409,31 @@
     function summarizeHistoryDetails(entry) {
       const details = entry?.details || {};
       const action = String(entry?.action || "");
+      const vmLabel = details.vm_name
+        ? `VM ${details.vm_name}${details.vm_id ? ` (${details.vm_id})` : ""}`
+        : (details.vm_id ? `VM ${details.vm_id}` : "VM n/d");
+      const sourceDs = details.source_datastore_name || details.source_datastore_id || "";
+      const targetDs = details.target_datastore_name || details.target_datastore_id || "";
+      const movePath = sourceDs && targetDs
+        ? `${sourceDs} -> ${targetDs}`
+        : (sourceDs ? `origem ${sourceDs}` : (targetDs ? `destino ${targetDs}` : ""));
+      const taskLabel = details.task_id ? `task ${details.task_id}` : "";
+      const durationLabel = formatDurationFromSeconds(details.duration_seconds)
+        ? `duracao ${formatDurationFromSeconds(details.duration_seconds)}`
+        : "";
+      const progressLabel = details.progress === null || details.progress === undefined || Number.isNaN(Number(details.progress))
+        ? ""
+        : `progresso ${formatNumber(details.progress)}%`;
+      const stateLabel = details.state ? `estado ${details.state}` : "";
+      const errorLabel = details.error || "";
+
       if (action === "vm_move_request") {
-        const vm = details.vm_id ? `VM ${details.vm_id}` : "VM n/d";
-        const fromDs = details.source_datastore_id ? `de ${details.source_datastore_id}` : "";
-        const toDs = details.target_datastore_id ? `para ${details.target_datastore_id}` : "";
-        const task = details.task_id ? `task ${details.task_id}` : "";
         const reason = details.reason || details.error || "";
-        return [vm, fromDs, toDs, task, reason].filter(Boolean).join(" · ");
+        return [vmLabel, movePath, taskLabel, stateLabel, reason].filter(Boolean).join(" · ");
+      }
+      if (action === "vm_move_result") {
+        const summary = String(entry?.status || "").toLowerCase() === "success" ? "concluida" : "resultado";
+        return [summary, vmLabel, movePath, taskLabel, durationLabel, progressLabel, errorLabel].filter(Boolean).join(" · ");
       }
       if (action === "read_only_toggle") {
         return `read_only: ${details.previous_read_only} -> ${details.current_read_only}`;
@@ -1535,7 +2442,11 @@
         return [details.host, details.user, details.error].filter(Boolean).join(" · ");
       }
       if (action === "task_status_query") {
-        return [details.task_id, details.state, details.error].filter(Boolean).join(" · ");
+        const foundLabel = details.found === false ? "task nao encontrada" : "";
+        const entityLabel = details.entity_name ? `entidade ${details.entity_name}` : "";
+        return [taskLabel, vmLabel !== "VM n/d" ? vmLabel : "", movePath, stateLabel, progressLabel, durationLabel, entityLabel, foundLabel, errorLabel]
+          .filter(Boolean)
+          .join(" · ");
       }
       const compact = Object.entries(details)
         .slice(0, 4)
@@ -1719,8 +2630,16 @@
               </thead>
               <tbody>
                 ${state.clusters.map((cluster) => {
-                  const latency = getClusterLatencySummary(cluster.id);
-                  const detailLoaded = !!state.clusterDetails[cluster.id];
+                  const detailLatency = getClusterLatencySummary(cluster.id);
+                  const summaryLatency = cluster.avg_latency_ms !== null && cluster.avg_latency_ms !== undefined && !Number.isNaN(Number(cluster.avg_latency_ms))
+                    ? Number(cluster.avg_latency_ms)
+                    : null;
+                  const latency = detailLatency ?? summaryLatency;
+                  const spaceThreshold = formatClusterSpaceThreshold(cluster);
+                  const ioThreshold = formatClusterIoThreshold(cluster);
+                  const latencyBadge = latency !== null
+                    ? statusBadge(formatMs(latency), latency > 20 ? "amber" : "emerald")
+                    : statusBadge("Sem amostra real", "slate");
 
                   return `
                     <tr
@@ -1731,7 +2650,7 @@
                       <td class="px-6 py-4">
                         <div class="font-semibold">${escapeHtml(cluster.name)}</div>
                         <div class="text-xs ${theme.subtle}">
-                          Free threshold: ${cluster.free_space_threshold ?? "—"} GB · IO threshold: ${cluster.io_latency_threshold ?? "—"}
+                          Space threshold: ${spaceThreshold} · IO threshold: ${ioThreshold}
                         </div>
                       </td>
                       <td class="px-6 py-4">
@@ -1740,11 +2659,7 @@
                       <td class="px-6 py-4">${formatNumber(cluster.datastore_count || 0)}</td>
                       <td class="px-6 py-4">${formatGb(cluster.total_free_gb)}</td>
                       <td class="px-6 py-4">
-                        ${
-                          detailLoaded
-                            ? (latency !== null ? statusBadge(formatMs(latency), latency > 20 ? "amber" : "emerald") : statusBadge("Unavailable", "slate"))
-                            : '<div class="skeleton h-6 w-24 rounded-full"></div>'
-                        }
+                        ${latencyBadge}
                       </td>
                       <td class="px-6 py-4 text-right">
                         <button
@@ -1809,7 +2724,6 @@
       const diagMessage = diagForCurrentCluster ? String(diagPayload?.message || "").trim() : "";
 
       return `
-        ${renderReadOnlyBanner()}
         ${errorBanner(state.errors.clusterDetail || state.errors.clusterRecommendations || state.errors.clusterCandidates || state.errors.clusterSimulation || state.errors.datastoreVms || state.errors.moveOptions || state.errors.taskStatus || state.errors.vmMove || state.errors.latencyDiagnostics)}
         ${
           latencyMissing
@@ -1852,8 +2766,8 @@
                 ${detail.sdrs_enabled ? statusBadge("SDRS Enabled", "emerald") : statusBadge("SDRS Disabled", "amber")}
                 ${statusBadge(detail.sdrs_automation_level || "Unknown", "teal")}
                 ${statusBadge(`Datastores ${detail.datastore_count ?? 0}`, "sky")}
-                ${statusBadge(`Free threshold ${detail.free_space_threshold ?? "—"} GB`, "violet")}
-                ${statusBadge(`IO threshold ${detail.io_latency_threshold ?? "—"}`, "slate")}
+                ${statusBadge(`Space threshold ${formatClusterSpaceThreshold(detail)}`, "violet")}
+                ${statusBadge(`IO threshold ${formatClusterIoThreshold(detail)}`, "slate")}
               </div>
             </div>
           </div>
@@ -1887,12 +2801,14 @@
                           <p class="text-sm ${theme.subtle}">
                             Capacity ${formatGb(ds.capacity_gb)} · Free ${formatGb(ds.free_gb)}
                           </p>
+                          <p class="text-xs ${theme.subtle} mt-1">
+                            Norm Lat ${formatUs(ds.io_normalized_latency_us)} · VM Obs ${formatUs(ds.io_vm_observed_latency_us)}
+                          </p>
+                          <p class="text-xs ${theme.subtle}">
+                            Agg IOPS ${formatIops(ds.io_aggregate_iops)} · SIOC Activity ${formatPct(ds.io_activity_pct)}
+                          </p>
                         </div>
-                        ${
-                          ds.latency_ms !== null && ds.latency_ms !== undefined
-                            ? statusBadge(formatMs(ds.latency_ms), Number(ds.latency_ms) > 20 ? "amber" : "emerald")
-                            : statusBadge("Latency n/a", "slate")
-                        }
+                        ${datastoreLatencyBadge(ds, detail)}
                       </div>
 
                       <div class="mb-3">
@@ -2246,6 +3162,11 @@
       const poweredOnCount = vms.filter((vm) => String(vm.power_state || "").toLowerCase() === "poweredon").length;
       const poweredOffCount = vms.length - poweredOnCount;
       const totalVmSizeGb = vms.reduce((sum, vm) => sum + Number(vm.size_gb || 0), 0);
+      const selectedVmIds = getSelectedVmIdsForCurrentDatastore(clusterId, datastoreId);
+      const selectedVmIdSet = new Set(selectedVmIds);
+      const selectedVms = vms.filter((vm) => selectedVmIdSet.has(String(vm.vm_id || "")));
+      const selectedVmTotalSizeGb = selectedVms.reduce((sum, vm) => sum + Number(vm.size_gb || 0), 0);
+      const allVmsSelected = vms.length > 0 && selectedVmIds.length === vms.length;
 
       const formMatchesSource = state.moveForm.clusterId === clusterId && state.moveForm.sourceDatastoreId === datastoreId;
       const form = formMatchesSource
@@ -2271,10 +3192,10 @@
         ? selectedTargetOption.reasons
         : [];
       const hasMoveSelection = Boolean(form.vmId && form.targetDatastoreId);
+      const hasBatchSelection = Boolean(selectedVmIds.length && form.targetDatastoreId);
       const activePreview = buildMovePreview(clusterId, datastoreId, form.targetDatastoreId, form.vmId);
 
       return `
-        ${renderReadOnlyBanner()}
         ${errorBanner(state.errors.clusterDetail || state.errors.clusterSimulation || state.errors.datastoreVms || state.errors.moveOptions || state.errors.taskStatus || state.errors.vmMove || state.errors.latencyDiagnostics)}
         ${
           latencyUnavailable
@@ -2313,7 +3234,11 @@
               <div class="flex flex-wrap gap-2">
                 ${statusBadge(`Used ${formatPct(datastore.used_pct)}`, Number(datastore.used_pct || 0) > 85 ? "amber" : "emerald")}
                 ${statusBadge(`Free ${formatGb(datastore.free_gb)}`, "sky")}
-                ${datastore.latency_ms !== null && datastore.latency_ms !== undefined ? statusBadge(`Latency ${formatMs(datastore.latency_ms)}`, Number(datastore.latency_ms) > 20 ? "amber" : "emerald") : statusBadge("Latency n/a", "slate")}
+                ${datastoreLatencyBadge(datastore, detail)}
+                ${statusBadge(`Norm Lat ${formatUs(datastore.io_normalized_latency_us)}`, "slate")}
+                ${statusBadge(`VM Obs ${formatUs(datastore.io_vm_observed_latency_us)}`, "slate")}
+                ${statusBadge(`Agg IOPS ${formatIops(datastore.io_aggregate_iops)}`, "sky")}
+                ${statusBadge(`Activity ${formatPct(datastore.io_activity_pct)}`, "violet")}
                 ${statusBadge(`VMs ${formatNumber(vms.length)}`, "teal")}
               </div>
             </div>
@@ -2344,7 +3269,7 @@
             <div>
               <h4 class="text-lg font-semibold">Planejamento de migração</h4>
               <p class="text-sm ${theme.subtle}">
-                Selecione VM e destino para ver compatibilidade e projeção em tempo real antes de confirmar.
+                Você pode migrar uma VM por vez ou selecionar várias VMs na tabela para enfileirar em lote.
               </p>
             </div>
             <button
@@ -2383,7 +3308,7 @@
                 <select
                   name="targetDatastoreId"
                   class="w-full rounded-2xl border px-3 py-2 text-sm ${theme.input}"
-                  ${state.loading.vmMove || !form.vmId ? "disabled" : ""}
+                  ${state.loading.vmMove || state.moveBatch.running || (!form.vmId && !selectedVmIds.length) ? "disabled" : ""}
                 >
                   <option value="">Selecione destino</option>
                   ${destinationOptions.map((item) => `
@@ -2405,12 +3330,48 @@
                 <button
                   type="submit"
                   class="w-full inline-flex items-center justify-center rounded-2xl px-4 py-2 text-sm font-semibold text-white ${readOnly ? "bg-slate-400 cursor-not-allowed" : "bg-teal-600 hover:bg-teal-700"}"
-                  ${readOnly || state.loading.vmMove || !hasMoveSelection || !selectedTargetCompatible ? "disabled" : ""}
+                  ${readOnly || state.loading.vmMove || state.moveBatch.running || !hasMoveSelection || !selectedTargetCompatible ? "disabled" : ""}
                 >
                   ${state.loading.vmMove ? "Enfileirando..." : "Validar e confirmar move"}
                 </button>
               </div>
             </form>
+
+            <div class="mt-4 rounded-2xl border ${theme.rowBorder} p-3">
+              <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div class="text-sm ${theme.subtle}">
+                  Selecionadas: <span class="font-semibold ${theme.strong}">${formatNumber(selectedVmIds.length)}</span>
+                  ${selectedVmIds.length ? ` · Tamanho total: <span class="font-semibold ${theme.strong}">${formatGb(selectedVmTotalSizeGb)}</span>` : ""}
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    data-action="clear-selected-vms"
+                    class="inline-flex items-center justify-center rounded-2xl border px-3 py-2 text-xs font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder} ${state.moveBatch.running || !selectedVmIds.length ? "opacity-60 cursor-not-allowed" : ""}"
+                    ${state.moveBatch.running || !selectedVmIds.length ? "disabled" : ""}
+                  >
+                    Limpar seleção
+                  </button>
+                  <button
+                    type="button"
+                    data-action="open-batch-move-confirm"
+                    class="inline-flex items-center justify-center rounded-2xl px-3 py-2 text-xs font-semibold text-white ${readOnly || state.moveBatch.running || !hasBatchSelection ? "bg-slate-400 cursor-not-allowed" : "bg-indigo-600 hover:bg-indigo-700"}"
+                    ${readOnly || state.moveBatch.running || !hasBatchSelection ? "disabled" : ""}
+                  >
+                    ${state.moveBatch.running ? `Migrando ${formatNumber(state.moveBatch.processed)}/${formatNumber(state.moveBatch.total)}` : `Migrar selecionadas (${formatNumber(selectedVmIds.length)})`}
+                  </button>
+                </div>
+              </div>
+              ${
+                state.moveBatch.running
+                  ? `
+                    <div class="mt-3 text-xs ${theme.subtle}">
+                      Processadas: ${formatNumber(state.moveBatch.processed)} · Enfileiradas: ${formatNumber(state.moveBatch.queued)} · Falhas: ${formatNumber(state.moveBatch.failed)}
+                    </div>
+                  `
+                  : ""
+              }
+            </div>
 
             ${
               form.vmId && state.loading.moveOptions
@@ -2522,6 +3483,15 @@
                   <table class="min-w-full">
                     <thead class="${theme.tableHead}">
                       <tr>
+                        <th class="px-4 py-4 text-left text-xs font-semibold uppercase tracking-wide">
+                          <input
+                            type="checkbox"
+                            data-action="toggle-select-all-vms"
+                            class="h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                            ${allVmsSelected ? "checked" : ""}
+                            ${state.moveBatch.running ? "disabled" : ""}
+                          />
+                        </th>
                         <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">VM</th>
                         <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Power</th>
                         <th class="px-6 py-4 text-left text-xs font-semibold uppercase tracking-wide">Size</th>
@@ -2531,6 +3501,16 @@
                     <tbody>
                       ${vms.map((vm) => `
                         <tr class="border-t ${theme.rowBorder}">
+                          <td class="px-4 py-4 align-top">
+                            <input
+                              type="checkbox"
+                              data-action="toggle-select-vm"
+                              data-vm-id="${escapeHtml(vm.vm_id)}"
+                              class="h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                              ${selectedVmIdSet.has(String(vm.vm_id || "")) ? "checked" : ""}
+                              ${state.moveBatch.running ? "disabled" : ""}
+                            />
+                          </td>
                           <td class="px-6 py-4">
                             <div class="font-medium">${escapeHtml(vm.vm_name || "unknown")}</div>
                             <div class="text-xs ${theme.subtle}">${escapeHtml(vm.vm_id || "")}</div>
@@ -2567,7 +3547,6 @@
       }
 
       return `
-        ${renderReadOnlyBanner()}
         ${errorBanner(state.errors.recommendations || state.errors.candidates)}
         <section class="mb-8 rounded-3xl border shadow-soft overflow-hidden ${theme.panel}">
           <div class="px-6 py-5 border-b ${theme.divider} flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -2718,16 +3697,17 @@
       const moveScope = (Array.isArray(safetyPolicy.allowed_write_operations) && safetyPolicy.allowed_write_operations.includes("vm_storage_relocate"))
         ? "Somente move datastore"
         : "Sem escrita";
+      const migrationRequested = state.health?.migration_client_requested === true;
+      const migrationReady = state.health?.migration_client_initialized === true;
 
       return `
-        ${renderReadOnlyBanner()}
-        ${errorBanner(state.errors.vcenterConfig || state.connectionError)}
+        ${errorBanner(state.errors.vcenterConfig || state.errors.vcenterMigrationConfig || state.connectionError)}
         <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
           <div class="xl:col-span-2 rounded-3xl border p-6 shadow-soft ${theme.panel}">
             <div class="mb-6 flex items-center justify-between gap-3">
               <div>
-                <h3 class="text-lg font-semibold">vCenter configuration</h3>
-                <p class="text-sm ${theme.subtle}">Cadastro em runtime no backend para testes controlados</p>
+                <h3 class="text-lg font-semibold">Identidade de coleta (read)</h3>
+                <p class="text-sm ${theme.subtle}">Usuário usado para inventário, dashboards e leitura de métricas</p>
               </div>
               ${state.loading.vcenterConfig ? statusBadge("Saving", "sky") : ""}
             </div>
@@ -2798,6 +3778,78 @@
                 </button>
               </div>
             </form>
+
+            <div class="my-6 border-t ${theme.divider}"></div>
+
+            <div class="mb-6 flex items-center justify-between gap-3">
+              <div>
+                <h3 class="text-lg font-semibold">Identidade de migração (write)</h3>
+                <p class="text-sm ${theme.subtle}">
+                  Usuário dedicado para Storage vMotion manual. Se host ficar vazio, usa o host principal.
+                </p>
+              </div>
+              ${state.loading.vcenterMigrationConfig ? statusBadge("Saving", "sky") : ""}
+            </div>
+
+            <form id="vcenter-migration-form" class="space-y-5">
+              <div>
+                <label for="vcMigrationHost" class="mb-2 block text-sm font-semibold">Host (opcional)</label>
+                <input
+                  id="vcMigrationHost"
+                  name="migration_host"
+                  type="text"
+                  value="${escapeHtml(state.vcenterMigrationForm.host)}"
+                  class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                  placeholder="s2001.ms"
+                />
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label for="vcMigrationUser" class="mb-2 block text-sm font-semibold">Usuário de migração</label>
+                  <input
+                    id="vcMigrationUser"
+                    name="migration_user"
+                    type="text"
+                    value="${escapeHtml(state.vcenterMigrationForm.user)}"
+                    class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                    placeholder="svc-sdrs-move@vsphere.local"
+                  />
+                </div>
+
+                <div>
+                  <label for="vcMigrationPassword" class="mb-2 block text-sm font-semibold">Senha de migração</label>
+                  <input
+                    id="vcMigrationPassword"
+                    name="migration_password"
+                    type="password"
+                    value="${escapeHtml(state.vcenterMigrationForm.password)}"
+                    class="w-full rounded-2xl border px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-teal-500 ${theme.input}"
+                    placeholder="••••••••"
+                  />
+                </div>
+              </div>
+
+              <label class="inline-flex items-center gap-2 text-sm">
+                <input
+                  id="vcMigrationVerifySsl"
+                  name="migration_verify_ssl"
+                  type="checkbox"
+                  class="h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-500"
+                  ${state.vcenterMigrationForm.verify_ssl ? "checked" : ""}
+                />
+                <span>Verificar certificado SSL (migração)</span>
+              </label>
+
+              <div class="flex flex-wrap gap-3">
+                <button
+                  type="submit"
+                  class="inline-flex items-center rounded-2xl bg-teal-600 px-4 py-3 text-sm font-semibold text-white hover:bg-teal-700"
+                >
+                  Salvar usuário de migração
+                </button>
+              </div>
+            </form>
           </div>
 
           <div class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
@@ -2826,9 +3878,32 @@
                 <span class="${theme.subtle}">Conexão vCenter</span>
                 <span>${getConnectionBadge()}</span>
               </div>
-              <div class="pt-2 text-xs ${theme.subtle}">
-                A configuração fica somente em memória do backend nesta fase.
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Usuário coleta (read)</span>
+                <span class="font-semibold">${escapeHtml(state.vcenterForm.user || state.health?.vcenter_user || "—")}</span>
               </div>
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Usuário migração (write)</span>
+                <span class="font-semibold">${escapeHtml(state.health?.migration_user || state.vcenterMigrationForm.user || "—")}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="${theme.subtle}">Separação read/write</span>
+                <span>
+                  ${
+                    migrationRequested
+                      ? (migrationReady ? statusBadge("Ativa", "emerald") : statusBadge("Configurar", "amber"))
+                      : statusBadge("Não configurada", "slate")
+                  }
+                </span>
+              </div>
+              <div class="pt-2 text-xs ${theme.subtle}">
+                A configuração de migração é persistida de forma protegida em disco no backend e reaplicada após reinício.
+              </div>
+              ${
+                state.health?.migration_client_error
+                  ? `<div class="pt-2 text-xs text-rose-600">${escapeHtml(state.health.migration_client_error)}</div>`
+                  : ""
+              }
             </div>
           </div>
         </section>
@@ -2845,9 +3920,19 @@
       const toggleKeyRequired = safetyPolicy.read_only_toggle_key_required === true;
       const toggleOpen = safetyPolicy.read_only_toggle_open !== false;
       const historyEnabled = safetyPolicy.operation_history_enabled !== false;
+      const clusters = Array.isArray(state.clusters) ? state.clusters : [];
+      const selectedPolicyClusterId = String(
+        state.settingsPolicyClusterId || clusters[0]?.id || ""
+      ).trim();
+      const selectedPolicyCluster = clusters.find((cluster) => String(cluster?.id || "") === selectedPolicyClusterId) || null;
+      const settingsPolicyMatrix = selectedPolicyClusterId
+        ? (state.clusterPolicyMatrix[selectedPolicyClusterId] || null)
+        : null;
+      const settingsHardRules = Array.isArray(settingsPolicyMatrix?.hard_rules) ? settingsPolicyMatrix.hard_rules : [];
+      const settingsSoftRules = Array.isArray(settingsPolicyMatrix?.soft_rules) ? settingsPolicyMatrix.soft_rules : [];
       return `
         ${renderReadOnlyBanner()}
-        ${errorBanner(state.errors.readOnlyToggle || state.errors.history)}
+        ${errorBanner(state.errors.readOnlyToggle || state.errors.history || state.errors.clusterPolicyMatrix)}
         <section class="grid grid-cols-1 xl:grid-cols-3 gap-6">
           <div class="xl:col-span-2 rounded-3xl border p-6 shadow-soft ${theme.panel}">
             <div class="mb-6">
@@ -2952,6 +4037,103 @@
 
             <div class="my-6 border-t ${theme.divider}"></div>
 
+            <div class="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h3 class="text-lg font-semibold">SDRS Policy Matrix</h3>
+                <p class="text-sm ${theme.subtle}">
+                  Regras hard/soft por cluster para diagnóstico operacional.
+                </p>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                <select
+                  data-action="change-settings-policy-cluster"
+                  class="rounded-2xl border px-3 py-2 text-sm ${theme.input}"
+                >
+                  ${
+                    !clusters.length
+                      ? `<option value="">Sem clusters</option>`
+                      : clusters.map((cluster) => `
+                          <option value="${escapeHtml(cluster.id)}" ${selectedPolicyClusterId === String(cluster.id) ? "selected" : ""}>
+                            ${escapeHtml(cluster.name || cluster.id)}
+                          </option>
+                        `).join("")
+                  }
+                </select>
+                <button
+                  type="button"
+                  data-action="refresh-settings-policy"
+                  class="inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm font-semibold ${theme.softBg} ${theme.hover} ${theme.rowBorder} ${state.loading.clusterPolicyMatrix ? "opacity-70 cursor-not-allowed" : ""}"
+                  ${state.loading.clusterPolicyMatrix || !selectedPolicyClusterId ? "disabled" : ""}
+                >
+                  <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                  ${state.loading.clusterPolicyMatrix ? "Atualizando..." : "Atualizar"}
+                </button>
+              </div>
+            </div>
+
+            ${
+              !selectedPolicyClusterId
+                ? `<div class="rounded-2xl border ${theme.rowBorder} p-4 text-sm ${theme.subtle}">Selecione um cluster para carregar a policy matrix.</div>`
+                : state.loading.clusterPolicyMatrix && !settingsPolicyMatrix
+                  ? `<div class="space-y-3">${Array.from({ length: 4 }).map(() => `<div class="skeleton h-12 rounded-2xl"></div>`).join("")}</div>`
+                  : !settingsPolicyMatrix
+                    ? `<div class="rounded-2xl border ${theme.rowBorder} p-4 text-sm ${theme.subtle}">Matriz indisponível para o cluster ${escapeHtml(selectedPolicyCluster?.name || selectedPolicyClusterId)}.</div>`
+                    : `
+                      <div class="mb-6 rounded-2xl border ${theme.rowBorder} p-4">
+                        <div class="mb-3 flex flex-wrap gap-2">
+                          ${statusBadge(`Cluster ${escapeHtml(selectedPolicyCluster?.name || selectedPolicyClusterId)}`, "slate")}
+                          ${statusBadge(`Mode ${escapeHtml(settingsPolicyMatrix.mode || "unknown")}`, "sky")}
+                          ${statusBadge(`Hard fail ${formatNumber(settingsPolicyMatrix.summary?.hard?.fail || 0)}`, (Number(settingsPolicyMatrix.summary?.hard?.fail || 0) > 0 ? "rose" : "emerald"))}
+                          ${statusBadge(`Soft fail ${formatNumber(settingsPolicyMatrix.summary?.soft?.fail || 0)}`, (Number(settingsPolicyMatrix.summary?.soft?.fail || 0) > 0 ? "amber" : "emerald"))}
+                        </div>
+                        <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                          <div>
+                            <h5 class="font-semibold mb-3">Hard Rules</h5>
+                            <div class="space-y-3">
+                              ${
+                                settingsHardRules.length
+                                  ? settingsHardRules.map((rule) => `
+                                    <div class="rounded-2xl border ${theme.rowBorder} p-4">
+                                      <div class="flex items-center justify-between gap-3">
+                                        <div class="font-semibold">${escapeHtml(rule.title || rule.rule_id || "rule")}</div>
+                                        ${policyStatusBadge(rule.status)}
+                                      </div>
+                                      <div class="text-sm ${theme.subtle} mt-1">${escapeHtml(rule.description || "")}</div>
+                                      ${renderRuleEvidence(rule, theme)}
+                                      <div class="text-xs ${theme.subtle} mt-2 font-mono">${escapeHtml(rule.rule_id || "")}</div>
+                                    </div>
+                                  `).join("")
+                                  : `<div class="text-sm ${theme.subtle}">Sem hard rules avaliadas.</div>`
+                              }
+                            </div>
+                          </div>
+                          <div>
+                            <h5 class="font-semibold mb-3">Soft Rules</h5>
+                            <div class="space-y-3">
+                              ${
+                                settingsSoftRules.length
+                                  ? settingsSoftRules.map((rule) => `
+                                    <div class="rounded-2xl border ${theme.rowBorder} p-4">
+                                      <div class="flex items-center justify-between gap-3">
+                                        <div class="font-semibold">${escapeHtml(rule.title || rule.rule_id || "rule")}</div>
+                                        ${policyStatusBadge(rule.status)}
+                                      </div>
+                                      <div class="text-sm ${theme.subtle} mt-1">${escapeHtml(rule.description || "")}</div>
+                                      ${renderRuleEvidence(rule, theme)}
+                                      <div class="text-xs ${theme.subtle} mt-2 font-mono">${escapeHtml(rule.rule_id || "")}</div>
+                                    </div>
+                                  `).join("")
+                                  : `<div class="text-sm ${theme.subtle}">Sem soft rules avaliadas.</div>`
+                              }
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    `
+            }
+
+            <div class="my-6 border-t ${theme.divider}"></div>
+
             <div class="mb-4 flex items-center justify-between gap-3">
               <div>
                 <h3 class="text-lg font-semibold">Histórico operacional</h3>
@@ -3028,7 +4210,6 @@
     function renderHistory() {
       const theme = getThemeClasses();
       return `
-        ${renderReadOnlyBanner()}
         ${errorBanner(state.errors.history)}
         <section class="rounded-3xl border p-6 shadow-soft ${theme.panel}">
           <div class="mb-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -3104,6 +4285,160 @@
       return `
         <div class="fixed bottom-5 right-5 z-[70] max-w-sm rounded-2xl border px-4 py-3 text-sm font-medium shadow-soft ${tones[state.toast.type] || tones.info}">
           ${escapeHtml(state.toast.message)}
+        </div>
+      `;
+    }
+
+    function migrationStateBadge(stateText) {
+      const normalized = normalizeTaskState(stateText);
+      if (normalized === "success") return statusBadge("Concluída", "emerald");
+      if (normalized === "error") return statusBadge("Falha", "rose");
+      if (normalized === "running") return statusBadge("Em execução", "sky");
+      if (normalized === "queued") return statusBadge("Na fila", "amber");
+      return statusBadge(normalized || "desconhecido", "slate");
+    }
+
+    function renderMigrationEta(item) {
+      const normalized = normalizeTaskState(item?.state);
+      if (normalized === "success" && item?.completeTime) {
+        return `Concluída em ${formatDateTime(item.completeTime)}`;
+      }
+      if (item?.etaIso) {
+        return `ETA ~ ${formatDateTime(item.etaIso)}`;
+      }
+      if (item?.startTime && safeProgress(item?.progress) > 0) {
+        return "ETA calculando...";
+      }
+      if (normalized === "queued") {
+        return "Aguardando início no vCenter";
+      }
+      return "ETA indisponível";
+    }
+
+    function renderMigrationTrackerFab(theme) {
+      const active = getActiveMigrationCount();
+      const total = (state.migrationTracker.items || []).filter(item => item.sourceApp === CLIENT_APP_ID).length;
+      const ringTone = active > 0 ? "ring-emerald-400/60" : "ring-slate-400/50";
+      const labelTone = active > 0 ? "text-emerald-700 bg-emerald-100" : "text-slate-700 bg-slate-200";
+      return `
+        <button
+          data-action="open-migration-tracker"
+          title="Abrir monitor de migrações"
+          class="fixed bottom-5 left-5 z-[72] h-14 w-14 rounded-full border ${theme.rowBorder} ${theme.panel} shadow-soft ring-2 ${ringTone} flex items-center justify-center"
+        >
+          <i data-lucide="arrow-right-left" class="h-5 w-5"></i>
+          <span class="absolute -top-1 -right-1 min-w-[1.35rem] h-5 px-1 rounded-full text-[10px] font-extrabold ${labelTone} border border-white/50 flex items-center justify-center">
+            ${escapeHtml(String(active > 0 ? active : total))}
+          </span>
+        </button>
+      `;
+    }
+
+    function renderMigrationTrackerModal(theme) {
+      if (!state.migrationTracker.modalOpen) return "";
+
+      const items = [...(state.migrationTracker.items || [])]
+        .filter(item => item.sourceApp === CLIENT_APP_ID)
+        .sort((a, b) => {
+          if (a.active !== b.active) return a.active ? -1 : 1;
+          return Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0);
+        });
+      const active = items.filter(item => item.active).length;
+      const failed = items.filter(item => normalizeTaskState(item.state) === "error").length;
+      const completed = items.filter(item => normalizeTaskState(item.state) === "success").length;
+
+      return `
+        <div class="fixed inset-0 z-[73] flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-slate-950/60" data-action="close-migration-tracker"></div>
+          <div class="relative z-10 w-full max-w-3xl rounded-3xl border ${theme.rowBorder} ${theme.panel} p-6 shadow-soft">
+            <div class="mb-5 flex items-start justify-between gap-4">
+              <div>
+                <h3 class="text-xl font-bold ${theme.strong}">Monitor de migrações</h3>
+                <p class="mt-1 text-sm ${theme.subtle}">
+                  Acompanhamento persistente de tasks de Storage vMotion, mesmo após refresh ou troca de tela.
+                </p>
+              </div>
+              <button
+                data-action="close-migration-tracker"
+                class="rounded-2xl border ${theme.rowBorder} p-2 ${theme.subtle} ${theme.hover}"
+              >
+                <i data-lucide="x" class="w-4 h-4"></i>
+              </button>
+            </div>
+
+            <div class="mb-4 grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div class="rounded-2xl border ${theme.rowBorder} ${theme.softBg} p-3">
+                <div class="text-xs uppercase tracking-wide ${theme.subtle}">Ativas</div>
+                <div class="mt-1 text-lg font-bold ${theme.strong}">${formatNumber(active)}</div>
+              </div>
+              <div class="rounded-2xl border ${theme.rowBorder} ${theme.softBg} p-3">
+                <div class="text-xs uppercase tracking-wide ${theme.subtle}">Concluídas</div>
+                <div class="mt-1 text-lg font-bold ${theme.strong}">${formatNumber(completed)}</div>
+              </div>
+              <div class="rounded-2xl border ${theme.rowBorder} ${theme.softBg} p-3">
+                <div class="text-xs uppercase tracking-wide ${theme.subtle}">Falhas</div>
+                <div class="mt-1 text-lg font-bold ${theme.strong}">${formatNumber(failed)}</div>
+              </div>
+              <div class="rounded-2xl border ${theme.rowBorder} ${theme.softBg} p-3 flex items-center justify-end">
+                <button
+                  data-action="refresh-migration-tracker"
+                  class="rounded-xl border ${theme.rowBorder} px-3 py-2 text-sm font-semibold ${theme.hover} ${state.migrationTracker.loading ? "opacity-60 cursor-not-allowed" : ""}"
+                  ${state.migrationTracker.loading ? "disabled" : ""}
+                >
+                  ${state.migrationTracker.loading ? "Atualizando..." : "Atualizar"}
+                </button>
+              </div>
+            </div>
+
+            <div class="max-h-[56vh] overflow-auto rounded-2xl border ${theme.rowBorder}">
+              ${
+                !items.length
+                  ? `<div class="p-6 text-sm ${theme.subtle}">Nenhuma migração registrada ainda.</div>`
+                  : items.map((item) => {
+                      const vmDisplay = resolveVmDisplayNameForTracker(item);
+                      const sourceDisplay = resolveDatastoreDisplayNameForTracker(item.clusterId, item.sourceDatastoreId, item.sourceDatastoreName);
+                      const targetDisplay = resolveDatastoreDisplayNameForTracker(item.clusterId, item.targetDatastoreId, item.targetDatastoreName);
+                      const clusterDisplay = resolveClusterDisplayNameForTracker(item);
+                      const showVmId = String(item.vmId || "").trim() && String(vmDisplay || "").trim() !== String(item.vmId || "").trim();
+                      const showClusterId = String(item.clusterId || "").trim() && String(clusterDisplay || "").trim() !== String(item.clusterId || "").trim();
+
+                      return `
+                        <div class="border-b ${theme.rowBorder} p-4 last:border-b-0 ${theme.hover}">
+                          <div class="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                            <div>
+                              <div class="text-sm font-semibold ${theme.strong}">
+                                ${escapeHtml(vmDisplay || "VM não identificada")}
+                                ${showVmId ? `<span class="${theme.subtle} font-normal">(${escapeHtml(item.vmId)})</span>` : ""}
+                              </div>
+                              <div class="mt-1 text-xs ${theme.subtle}">
+                                ${escapeHtml(sourceDisplay)} → ${escapeHtml(targetDisplay)}
+                              </div>
+                              <div class="mt-1 text-xs ${theme.subtle}">
+                                Task: ${escapeHtml(item.taskId)}
+                                ${clusterDisplay ? ` · Cluster ${escapeHtml(clusterDisplay)}${showClusterId ? ` (${escapeHtml(item.clusterId)})` : ""}` : ""}
+                              </div>
+                            </div>
+                            <div class="text-right">
+                              ${migrationStateBadge(item.state)}
+                              <div class="mt-1 text-xs ${theme.subtle}">${escapeHtml(renderMigrationEta(item))}</div>
+                            </div>
+                          </div>
+                          <div class="mt-3">
+                            <div class="flex items-center justify-between text-xs ${theme.subtle}">
+                              <span>Progresso</span>
+                              <span>${item.progress === null ? "—" : `${formatNumber(item.progress)}%`}</span>
+                            </div>
+                            <div class="mt-1 h-2 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                              <div class="h-full rounded-full bg-sky-500 transition-all duration-300" style="width:${item.progress === null ? 0 : Number(item.progress)}%"></div>
+                            </div>
+                            ${item.error ? `<div class="mt-2 text-xs text-rose-600">${escapeHtml(item.error)}</div>` : ""}
+                          </div>
+                        </div>
+                      `;
+                    }).join("")
+              }
+            </div>
+          </div>
         </div>
       `;
     }
@@ -3223,9 +4558,154 @@
       `;
     }
 
+    function renderBatchMoveConfirmModal() {
+      if (!state.moveBatchConfirm.open) return "";
+      const payload = state.moveBatchConfirm;
+      const vmMap = new Map(
+        getDatastoreVms(payload.clusterId, payload.sourceDatastoreId).map((vm) => [String(vm.vm_id || ""), vm])
+      );
+      const selectedVms = (payload.vmIds || [])
+        .map((vmId) => vmMap.get(String(vmId || "")) || { vm_id: vmId, vm_name: vmId, size_gb: null })
+        .filter(Boolean);
+      const selectedTotalSizeGb = selectedVms.reduce((sum, vm) => sum + Number(vm.size_gb || 0), 0);
+      const previewVms = selectedVms.slice(0, 8);
+      const sourceDatastore = findDatastoreById(payload.clusterId, payload.sourceDatastoreId);
+      const targetDatastore = findDatastoreById(payload.clusterId, payload.targetDatastoreId);
+      const sourceDatastoreLabel = sourceDatastore?.name || payload.sourceDatastoreName || payload.sourceDatastoreId || "origem";
+      const targetDatastoreLabel = targetDatastore?.name || payload.targetDatastoreName || payload.targetDatastoreId || "destino";
+
+      const sourceCapacityGb = Number(sourceDatastore?.capacity_gb);
+      const sourceCurrentFreeGb = Number(sourceDatastore?.free_gb);
+      const sourceCurrentUsedPct = Number(sourceDatastore?.used_pct);
+      const sourceHasBase = Number.isFinite(sourceCapacityGb) && sourceCapacityGb > 0 && Number.isFinite(sourceCurrentFreeGb);
+      const sourceProjectedFreeGb = sourceHasBase
+        ? Math.min(sourceCapacityGb, Math.max(0, sourceCurrentFreeGb + selectedTotalSizeGb))
+        : null;
+      const sourceProjectedUsedPct = sourceHasBase
+        ? ((sourceCapacityGb - sourceProjectedFreeGb) / sourceCapacityGb) * 100
+        : null;
+      const sourceCurrentUsedPctResolved = Number.isFinite(sourceCurrentUsedPct)
+        ? sourceCurrentUsedPct
+        : (sourceHasBase ? ((sourceCapacityGb - sourceCurrentFreeGb) / sourceCapacityGb) * 100 : null);
+
+      const targetCapacityGb = Number(targetDatastore?.capacity_gb);
+      const targetCurrentFreeGb = Number(targetDatastore?.free_gb);
+      const targetCurrentUsedPct = Number(targetDatastore?.used_pct);
+      const targetHasBase = Number.isFinite(targetCapacityGb) && targetCapacityGb > 0 && Number.isFinite(targetCurrentFreeGb);
+      const targetProjectedFreeGb = targetHasBase
+        ? Math.max(0, targetCurrentFreeGb - selectedTotalSizeGb)
+        : null;
+      const targetProjectedUsedPct = targetHasBase
+        ? ((targetCapacityGb - targetProjectedFreeGb) / targetCapacityGb) * 100
+        : null;
+      const targetCurrentUsedPctResolved = Number.isFinite(targetCurrentUsedPct)
+        ? targetCurrentUsedPct
+        : (targetHasBase ? ((targetCapacityGb - targetCurrentFreeGb) / targetCapacityGb) * 100 : null);
+
+      return `
+        <div class="fixed inset-0 z-[66] flex items-center justify-center p-4">
+          <div class="absolute inset-0 bg-slate-950/60" data-action="close-batch-move-confirm-modal"></div>
+          <div class="relative z-10 w-full max-w-2xl rounded-3xl border border-slate-200 bg-white p-6 shadow-soft">
+            <div class="mb-4 flex items-start justify-between gap-4">
+              <div>
+                <h3 class="text-xl font-bold text-slate-900">Confirmar migração em lote</h3>
+                <p class="mt-2 text-sm text-slate-500">
+                  Esta ação vai enfileirar uma task de Storage vMotion para cada VM selecionada.
+                </p>
+              </div>
+              <button
+                data-action="close-batch-move-confirm-modal"
+                class="rounded-2xl border border-slate-200 p-2 text-slate-500 hover:bg-slate-50"
+                ${state.moveBatch.running ? "disabled" : ""}
+              >
+                <i data-lucide="x" class="w-4 h-4"></i>
+              </button>
+            </div>
+
+            <div class="mb-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
+              <div><span class="font-semibold">Quantidade de VMs:</span> ${formatNumber((payload.vmIds || []).length)}</div>
+              <div class="mt-1"><span class="font-semibold">Tamanho total estimado:</span> ${formatGb(selectedTotalSizeGb)}</div>
+              <div class="mt-1"><span class="font-semibold">Origem:</span> ${escapeHtml(sourceDatastoreLabel)}</div>
+              <div class="mt-1"><span class="font-semibold">Destino:</span> ${escapeHtml(targetDatastoreLabel)}</div>
+            </div>
+
+            <div class="mb-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div class="rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs text-slate-500 mb-1">Origem após lote</div>
+                <div class="font-semibold mb-2">${escapeHtml(sourceDatastoreLabel)}</div>
+                <div class="text-sm text-slate-600">
+                  Used: ${formatPct(sourceCurrentUsedPctResolved)} → ${formatPct(sourceProjectedUsedPct)}
+                </div>
+                <div class="text-sm text-slate-600">
+                  Free: ${formatGb(Number.isFinite(sourceCurrentFreeGb) ? sourceCurrentFreeGb : null)} → ${formatGb(sourceProjectedFreeGb)}
+                </div>
+              </div>
+              <div class="rounded-2xl border border-slate-200 p-4">
+                <div class="text-xs text-slate-500 mb-1">Destino após lote</div>
+                <div class="font-semibold mb-2">${escapeHtml(targetDatastoreLabel)}</div>
+                <div class="text-sm text-slate-600">
+                  Used: ${formatPct(targetCurrentUsedPctResolved)} → ${formatPct(targetProjectedUsedPct)}
+                </div>
+                <div class="text-sm text-slate-600">
+                  Free: ${formatGb(Number.isFinite(targetCurrentFreeGb) ? targetCurrentFreeGb : null)} → ${formatGb(targetProjectedFreeGb)}
+                </div>
+              </div>
+            </div>
+
+            <div class="mb-6 rounded-2xl border border-slate-200">
+              <div class="border-b border-slate-200 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                VMs selecionadas
+              </div>
+              ${
+                !previewVms.length
+                  ? `<div class="px-4 py-3 text-sm text-slate-500">Nenhuma VM carregada.</div>`
+                  : `
+                    <div class="max-h-52 overflow-auto">
+                      ${previewVms.map((vm) => `
+                        <div class="flex items-center justify-between border-b border-slate-100 px-4 py-2 text-sm last:border-b-0">
+                          <div class="font-medium text-slate-800">${escapeHtml(vm.vm_name || vm.vm_id || "unknown")}</div>
+                          <div class="text-xs text-slate-500">${formatGb(vm.size_gb)}</div>
+                        </div>
+                      `).join("")}
+                    </div>
+                    ${
+                      selectedVms.length > previewVms.length
+                        ? `<div class="border-t border-slate-200 px-4 py-2 text-xs text-slate-500">...e mais ${formatNumber(selectedVms.length - previewVms.length)} VM(s)</div>`
+                        : ""
+                    }
+                  `
+              }
+            </div>
+
+            <div class="flex justify-end gap-3">
+              <button
+                data-action="close-batch-move-confirm-modal"
+                class="rounded-2xl border border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+                ${state.moveBatch.running ? "disabled" : ""}
+              >
+                Cancelar
+              </button>
+              <button
+                data-action="confirm-batch-vm-move"
+                class="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white hover:bg-indigo-700 ${state.moveBatch.running ? "opacity-60 cursor-not-allowed" : ""}"
+                ${state.moveBatch.running ? "disabled" : ""}
+              >
+                Confirmar lote
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
     function render() {
       const theme = getThemeClasses();
       const top = renderTopbarTitle();
+      const migrationActive = getActiveMigrationCount();
+      const migrationTotal = (state.migrationTracker.items || []).filter(
+        item => item.sourceApp === CLIENT_APP_ID
+      ).length;
+      const migrationBadgeCount = migrationActive > 0 ? migrationActive : migrationTotal;
 
       document.documentElement.classList.toggle("dark", state.theme === "dark");
 
@@ -3265,7 +4745,18 @@
             </nav>
 
             <div class="mt-auto p-4">
-              <div class="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+              <div class="relative overflow-visible rounded-2xl border border-slate-800 bg-slate-900 p-4">
+                <button
+                  data-action="open-migration-tracker"
+                  title="Abrir monitor de migrações"
+                  class="absolute -top-7 -left-3 z-20 h-12 w-12 rounded-full border border-slate-700 bg-slate-100 text-slate-900 shadow-xl ring-2 ring-teal-400/70 flex items-center justify-center hover:bg-white"
+                >
+                  <i data-lucide="arrow-right-left" class="h-4 w-4"></i>
+                  <span class="absolute -top-1 -right-1 min-w-[1.2rem] h-5 px-1 rounded-full text-[10px] font-extrabold text-emerald-800 bg-emerald-100 border border-white/70 flex items-center justify-center">
+                    ${escapeHtml(String(migrationBadgeCount))}
+                  </span>
+                </button>
+
                 <div class="mb-3 flex items-center justify-between">
                   <p class="text-xs uppercase tracking-wide text-slate-500">Connection</p>
                   ${getConnectionBadge()}
@@ -3343,6 +4834,8 @@
 
         ${renderModal()}
         ${renderMoveConfirmModal()}
+        ${renderBatchMoveConfirmModal()}
+        ${renderMigrationTrackerModal(theme)}
         ${renderToast()}
       `;
 
@@ -3402,12 +4895,24 @@
       }
 
       if (route.name === "vcenter") {
-        await loadVcenterConfig();
+        await Promise.all([loadVcenterConfig(), loadVcenterMigrationConfig()]);
         return;
       }
 
       if (route.name === "settings") {
-        await loadOperationHistory();
+        await Promise.all([loadOperationHistory(), loadClusters()]);
+        if (
+          state.settingsPolicyClusterId &&
+          !state.clusters.some((cluster) => String(cluster?.id || "") === String(state.settingsPolicyClusterId))
+        ) {
+          state.settingsPolicyClusterId = "";
+        }
+        if (!state.settingsPolicyClusterId && state.clusters.length) {
+          state.settingsPolicyClusterId = String(state.clusters[0]?.id || "");
+        }
+        if (state.settingsPolicyClusterId) {
+          await loadClusterPolicyMatrix(state.settingsPolicyClusterId);
+        }
         return;
       }
 
@@ -3429,6 +4934,21 @@
       if (!trigger) return;
 
       const action = trigger.dataset.action;
+
+      if (action === "open-migration-tracker") {
+        openMigrationTrackerModal();
+        return;
+      }
+
+      if (action === "close-migration-tracker") {
+        closeMigrationTrackerModal();
+        return;
+      }
+
+      if (action === "refresh-migration-tracker") {
+        await refreshMigrationTrackerTasks(true);
+        return;
+      }
 
       if (action === "toggle-sidebar") {
         state.sidebarOpen = !state.sidebarOpen;
@@ -3471,6 +4991,18 @@
         return;
       }
 
+      if (action === "refresh-settings-policy") {
+        let clusterId = String(state.settingsPolicyClusterId || "").trim();
+        if (!clusterId && state.clusters.length) {
+          clusterId = String(state.clusters[0]?.id || "").trim();
+          state.settingsPolicyClusterId = clusterId;
+        }
+        if (!clusterId) return;
+        delete state.clusterPolicyMatrix[clusterId];
+        await loadClusterPolicyMatrix(clusterId, true);
+        return;
+      }
+
       if (action === "refresh-cluster") {
         const clusterId = trigger.dataset.clusterId;
         if (!clusterId) return;
@@ -3488,6 +5020,8 @@
             vmId: "",
             targetDatastoreId: ""
           };
+          clearBatchSelection();
+          state.moveBatchConfirm.open = false;
         }
         await Promise.all([
           loadClusterDetail(clusterId, true),
@@ -3532,6 +5066,38 @@
         return;
       }
 
+      if (action === "toggle-select-vm") {
+        const vmId = String(trigger.dataset.vmId || "").trim();
+        setBatchVmSelection(vmId, Boolean(trigger.checked));
+        render();
+        return;
+      }
+
+      if (action === "toggle-select-all-vms") {
+        const ds = state.selectedDatastore;
+        if (!ds.clusterId || !ds.datastoreId) return;
+        if (Boolean(trigger.checked)) {
+          state.moveBatch.selectedVmIds = getDatastoreVms(ds.clusterId, ds.datastoreId)
+            .map((vm) => String(vm.vm_id || ""))
+            .filter(Boolean);
+        } else {
+          state.moveBatch.selectedVmIds = [];
+        }
+        render();
+        return;
+      }
+
+      if (action === "clear-selected-vms") {
+        clearBatchSelection();
+        render();
+        return;
+      }
+
+      if (action === "open-batch-move-confirm") {
+        openBatchMoveConfirmModal();
+        return;
+      }
+
       if (action === "view-datastore-page") {
         const clusterId = trigger.dataset.clusterId;
         const datastoreId = trigger.dataset.datastoreId;
@@ -3554,6 +5120,11 @@
         return;
       }
 
+      if (action === "close-batch-move-confirm-modal") {
+        closeBatchMoveConfirmModal();
+        return;
+      }
+
       if (action === "confirm-vm-move") {
         const payload = state.moveConfirm;
         if (!payload.clusterId || !payload.vmId || !payload.targetDatastoreId) return;
@@ -3563,6 +5134,11 @@
           payload.sourceDatastoreId,
           payload.targetDatastoreId
         );
+        return;
+      }
+
+      if (action === "confirm-batch-vm-move") {
+        await moveSelectedVmsToDatastore();
         return;
       }
 
@@ -3587,6 +5163,18 @@
     });
 
     document.addEventListener("change", async (event) => {
+      const changeAction = event.target?.dataset?.action;
+      if (changeAction === "change-settings-policy-cluster") {
+        const clusterId = String(event.target.value || "").trim();
+        state.settingsPolicyClusterId = clusterId;
+        if (clusterId) {
+          await loadClusterPolicyMatrix(clusterId);
+        } else {
+          render();
+        }
+        return;
+      }
+
       const form = event.target.closest("form");
       if (!form || form.id !== "move-vm-form") return;
 
@@ -3631,7 +5219,7 @@
 
     document.addEventListener("submit", async (event) => {
       const form = event.target;
-      if (!(form.id === "settings-form" || form.id === "read-only-form" || form.id === "vcenter-form" || form.id === "move-vm-form")) return;
+      if (!(form.id === "settings-form" || form.id === "read-only-form" || form.id === "vcenter-form" || form.id === "vcenter-migration-form" || form.id === "move-vm-form")) return;
 
       event.preventDefault();
 
@@ -3649,9 +5237,11 @@
         state.backendReachable = false;
         state.connected = false;
         state.connectionError = "";
+        state.settingsPolicyClusterId = "";
         state.clusters = [];
         state.clustersLoaded = false;
         state.clusterDetails = {};
+        state.clusterPolicyMatrix = {};
         state.clusterRecs = {};
         state.clusterCandidates = {};
         state.clusterSimulation = {};
@@ -3659,18 +5249,28 @@
         state.allRecommendations = [];
         state.allCandidates = [];
         state.operationHistory = [];
+        state.vcenterForm = { host: "", user: "", password: "", verify_ssl: true };
+        state.vcenterMigrationForm = { host: "", user: "", password: "", verify_ssl: true };
         state.selectedDatastore = { clusterId: "", datastoreId: "", datastoreName: "" };
         state.moveForm = { clusterId: "", sourceDatastoreId: "", vmId: "", targetDatastoreId: "" };
+        state.moveBatch = { selectedVmIds: [], running: false, processed: 0, queued: 0, failed: 0, total: 0 };
+        state.moveBatchConfirm = { open: false, clusterId: "", sourceDatastoreId: "", targetDatastoreId: "", targetDatastoreName: "", vmIds: [] };
         state.moveOptionsByVm = {};
         state.movePreview = null;
         state.moveConfirm.open = false;
         state.errors.history = "";
+        state.errors.clusterPolicyMatrix = "";
+        state.errors.vcenterConfig = "";
+        state.errors.vcenterMigrationConfig = "";
         stopMoveTaskPolling();
+        stopMigrationTrackerPolling();
+        state.migrationTracker = { modalOpen: false, loading: false, items: [] };
+        try { window.localStorage.removeItem(MIGRATION_TRACKER_STORAGE_KEY); } catch (error) {}
         state.moveTask = { taskId: "", state: "", progress: null, error: "", active: false };
         showToast("URL do backend atualizada só nesta sessão.", "success");
         render();
 
-        await Promise.all([loadHealth(true), connectVcenter(false)]);
+        await Promise.all([loadHealth(true), connectVcenter(false), loadVcenterConfig(true), loadVcenterMigrationConfig(true)]);
         return;
       }
 
@@ -3683,6 +5283,17 @@
 
         await saveVcenterConfig(true);
         await connectVcenter(true);
+        return;
+      }
+
+      if (form.id === "vcenter-migration-form") {
+        const formData = new FormData(form);
+        state.vcenterMigrationForm.host = String(formData.get("migration_host") || "").trim();
+        state.vcenterMigrationForm.user = String(formData.get("migration_user") || "").trim();
+        state.vcenterMigrationForm.password = String(formData.get("migration_password") || "");
+        state.vcenterMigrationForm.verify_ssl = formData.get("migration_verify_ssl") === "on";
+
+        await saveVcenterMigrationConfig(true);
         return;
       }
 
@@ -3716,10 +5327,12 @@
 
     async function init() {
       state.route = parseRoute();
+      loadMigrationTrackerFromStorage();
       render();
-      await Promise.all([loadHealth(true), loadVcenterConfig(true)]);
+      await Promise.all([loadHealth(true), loadVcenterConfig(true), loadVcenterMigrationConfig(true)]);
       await connectVcenter(false);
       await ensureDataForCurrentRoute();
+      await refreshMigrationTrackerTasks(true);
     }
 
     init();

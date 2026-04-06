@@ -333,7 +333,12 @@ def _serialize_datastore(ds_obj: Any) -> dict[str, Any]:
         "free_gb": _to_gb(free),
         "used_pct": used_pct,
         "latency_ms": None,
+        "io_normalized_latency_us": None,
+        "io_aggregate_iops": None,
+        "io_activity_pct": None,
+        "io_vm_observed_latency_us": None,
         "accessible": bool(getattr(summary, "accessible", True)),
+        "datastore_type": str(getattr(summary, "type", "") or "") or None,
         "_capacity_bytes": capacity,
         "_free_bytes": free,
         "_obj": ds_obj,
@@ -365,7 +370,64 @@ def _pod_sdrs_enabled(pod_obj: Any) -> bool:
         return False
 
 
+def _to_int_or_none(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _sdrs_automation_level(enabled: bool, behavior: Any) -> str:
+    if not enabled:
+        return "Disabled"
+    text = str(behavior or "").strip().lower()
+    if "auto" in text:
+        return "Automated"
+    return "Manual"
+
+
+def _extract_pod_sdrs_config(pod_obj: Any) -> dict[str, Any]:
+    try:
+        entry = getattr(pod_obj, "podStorageDrsEntry", None)
+        cfg = getattr(entry, "storageDrsConfig", None)
+        pod_cfg = getattr(cfg, "podConfig", None)
+    except Exception:
+        pod_cfg = None
+
+    enabled = False
+    behavior = None
+    free_space_threshold = None
+    space_threshold_mode = None
+    space_utilization_threshold = None
+    io_latency_threshold = None
+
+    if pod_cfg is not None:
+        enabled_raw = getattr(pod_cfg, "enabled", None)
+        enabled = bool(enabled_raw) if enabled_raw is not None else False
+        behavior = getattr(pod_cfg, "defaultVmBehavior", None)
+
+        space_cfg = getattr(pod_cfg, "spaceLoadBalanceConfig", None)
+        space_threshold_mode = getattr(space_cfg, "spaceThresholdMode", None)
+        space_utilization_threshold = _to_int_or_none(getattr(space_cfg, "spaceUtilizationThreshold", None))
+        free_space_threshold = _to_int_or_none(getattr(space_cfg, "freeSpaceThresholdGB", None))
+
+        io_cfg = getattr(pod_cfg, "ioLoadBalanceConfig", None)
+        io_latency_threshold = _to_int_or_none(getattr(io_cfg, "ioLatencyThreshold", None))
+
+    return {
+        "sdrs_enabled": enabled,
+        "sdrs_automation_level": _sdrs_automation_level(enabled, behavior),
+        "free_space_threshold": free_space_threshold,
+        "space_threshold_mode": space_threshold_mode,
+        "space_utilization_threshold": space_utilization_threshold,
+        "io_latency_threshold": io_latency_threshold,
+    }
+
+
 def _serialize_cluster_from_pod(pod_obj: Any) -> dict[str, Any]:
+    sdrs_cfg = _extract_pod_sdrs_config(pod_obj)
     datastores: list[dict[str, Any]] = []
     for child in list(getattr(pod_obj, "childEntity", []) or []):
         if isinstance(child, vim.Datastore):
@@ -374,7 +436,12 @@ def _serialize_cluster_from_pod(pod_obj: Any) -> dict[str, Any]:
     return {
         "id": getattr(pod_obj, "_moId", None),
         "name": str(getattr(pod_obj, "name", "")),
-        "sdrs_enabled": _pod_sdrs_enabled(pod_obj),
+        "sdrs_enabled": bool(sdrs_cfg.get("sdrs_enabled", _pod_sdrs_enabled(pod_obj))),
+        "sdrs_automation_level": sdrs_cfg.get("sdrs_automation_level", "Manual"),
+        "free_space_threshold": sdrs_cfg.get("free_space_threshold"),
+        "space_threshold_mode": sdrs_cfg.get("space_threshold_mode"),
+        "space_utilization_threshold": sdrs_cfg.get("space_utilization_threshold"),
+        "io_latency_threshold": sdrs_cfg.get("io_latency_threshold"),
         "datastores": datastores,
     }
 
@@ -394,64 +461,103 @@ def _latency_from_srm_summary_item(summary: Any) -> float | None:
     return None
 
 
-def _collect_datastore_latency_via_srm(content: Any, datastores: list[dict[str, Any]]) -> dict[str, float | None]:
+def _srm_summary_metrics(summary: Any) -> dict[str, float | None]:
+    vm_latency_ms = _mean_or_none(_safe_get(summary, "datastoreVmLatency", "vmLatency", "overallLatency"))
+    read_latency_ms = _mean_or_none(_safe_get(summary, "datastoreReadLatency", "readLatency"))
+    write_latency_ms = _mean_or_none(_safe_get(summary, "datastoreWriteLatency", "writeLatency"))
+    read_iops = _mean_or_none(_safe_get(summary, "datastoreReadIops", "readIops"))
+    write_iops = _mean_or_none(_safe_get(summary, "datastoreWriteIops", "writeIops"))
+
+    latency_ms = _latency_from_srm_summary_item(summary)
+
+    normalized_latency_us: float | None = None
+    rw_samples = []
+    rw_samples.extend(_extract_numeric_values(_safe_get(summary, "datastoreReadLatency", "readLatency")))
+    rw_samples.extend(_extract_numeric_values(_safe_get(summary, "datastoreWriteLatency", "writeLatency")))
+    if rw_samples:
+        normalized_latency_us = round((sum(rw_samples) / len(rw_samples)) * 1000.0, 2)
+    elif latency_ms is not None:
+        normalized_latency_us = round(latency_ms * 1000.0, 2)
+
+    vm_observed_latency_us = round(vm_latency_ms * 1000.0, 2) if vm_latency_ms is not None else None
+    aggregate_iops = None
+    if read_iops is not None or write_iops is not None:
+        aggregate_iops = round((read_iops or 0.0) + (write_iops or 0.0), 2)
+
+    # Dependendo da versão do vCenter, a atividade SIOC pode vir como duração ou percentual.
+    raw_activity = _safe_get(summary, "siocActiveTimePercentage", "siocActivityPct", "siocActivityDuration")
+    activity_pct: float | None = None
+    try:
+        if raw_activity is not None:
+            parsed = float(raw_activity)
+            if 0.0 <= parsed <= 100.0:
+                activity_pct = round(parsed, 2)
+    except Exception:
+        activity_pct = None
+
+    return {
+        "latency_ms": latency_ms,
+        "io_normalized_latency_us": normalized_latency_us,
+        "io_vm_observed_latency_us": vm_observed_latency_us,
+        "io_aggregate_iops": aggregate_iops,
+        "io_activity_pct": activity_pct,
+    }
+
+
+def _collect_datastore_srm_snapshot(content: Any, datastores: list[dict[str, Any]]) -> dict[str, dict[str, float | None]]:
     srm = getattr(content, "storageResourceManager", None)
     if srm is None or not hasattr(srm, "QueryDatastorePerformanceSummary"):
         return {}
 
-    ds_objs: list[Any] = []
-    ds_ids: list[str] = []
+    snapshot_by_ds: dict[str, dict[str, float | None]] = {}
     for ds in datastores:
         ds_obj = ds.get("_obj")
         ds_id = str(ds.get("id") or "")
         if ds_obj is None or not ds_id:
             continue
-        ds_objs.append(ds_obj)
-        ds_ids.append(ds_id)
 
-    if not ds_objs:
-        return {}
-
-    try:
         try:
-            raw = srm.QueryDatastorePerformanceSummary(datastore=ds_objs)
-        except TypeError:
-            # Ambientes legados podem exigir datastore por chamada.
-            raw_items: list[Any] = []
-            for ds_obj in ds_objs:
-                one = srm.QueryDatastorePerformanceSummary(datastore=[ds_obj])
-                if isinstance(one, list):
-                    raw_items.extend(one)
-                elif one is not None:
-                    raw_items.append(one)
-            raw = raw_items
-    except Exception:
-        logger.debug("QueryDatastorePerformanceSummary indisponível/falhou", exc_info=True)
-        return {}
-
-    items = raw if isinstance(raw, list) else [raw]
-    if not items:
-        return {}
-
-    latency_by_ds: dict[str, float | None] = {}
-    indexed = False
-    for item in items:
-        entity = _safe_get(item, "datastore", "entity")
-        ds_id = str(getattr(entity, "_moId", "") or _safe_get(item, "datastoreId", "id", default="") or "")
-        if not ds_id:
+            raw = srm.QueryDatastorePerformanceSummary(datastore=ds_obj)
+        except Exception:
+            logger.debug("QueryDatastorePerformanceSummary falhou para datastore=%s", ds_id, exc_info=True)
             continue
-        latency = _latency_from_srm_summary_item(item)
+
+        items = raw if isinstance(raw, list) else ([raw] if raw is not None else [])
+        if not items:
+            continue
+
+        matched_metrics: list[dict[str, float | None]] = []
+        for item in items:
+            entity = _safe_get(item, "datastore", "entity")
+            entity_id = str(getattr(entity, "_moId", "") or _safe_get(item, "datastoreId", "id", default="") or "")
+            if entity_id and entity_id != ds_id:
+                continue
+            matched_metrics.append(_srm_summary_metrics(item))
+
+        if not matched_metrics:
+            # Fallback por ordem quando o summary não retorna referência do datastore.
+            matched_metrics = [_srm_summary_metrics(items[0])]
+
+        merged: dict[str, float | None] = {}
+        for key in ("latency_ms", "io_normalized_latency_us", "io_vm_observed_latency_us", "io_aggregate_iops", "io_activity_pct"):
+            values = [m.get(key) for m in matched_metrics if m.get(key) is not None]
+            if values:
+                merged[key] = round(sum(float(v) for v in values) / len(values), 2)
+            else:
+                merged[key] = None
+
+        snapshot_by_ds[ds_id] = merged
+
+    return snapshot_by_ds
+
+
+def _collect_datastore_latency_via_srm(content: Any, datastores: list[dict[str, Any]]) -> dict[str, float | None]:
+    snapshot = _collect_datastore_srm_snapshot(content, datastores)
+    latency_by_ds: dict[str, float | None] = {}
+    for ds_id, metrics in snapshot.items():
+        latency = metrics.get("latency_ms")
         if latency is not None:
             latency_by_ds[ds_id] = latency
-            indexed = True
-
-    # Fallback por ordem de retorno quando id não vier no summary.
-    if not indexed and len(items) == len(ds_ids):
-        for idx, item in enumerate(items):
-            latency = _latency_from_srm_summary_item(item)
-            if latency is not None:
-                latency_by_ds[ds_ids[idx]] = latency
-
     return latency_by_ds
 
 
@@ -500,6 +606,73 @@ def _resolve_datastore_latency_counter_ids(content: Any) -> tuple[list[int], lis
     return _dedupe_sorted(read_counter_ids), _dedupe_sorted(write_counter_ids), counter_name_by_id
 
 
+def _resolve_datastore_perf_counter_catalog(content: Any) -> tuple[dict[str, list[int]], dict[int, str]]:
+    perf_manager = getattr(content, "perfManager", None)
+    if perf_manager is None:
+        return {
+            "normalized_latency": [],
+            "vm_observed_latency": [],
+            "iops_read": [],
+            "iops_write": [],
+            "activity_pct": [],
+        }, {}
+
+    catalog: dict[str, list[int]] = {
+        "normalized_latency": [],
+        "vm_observed_latency": [],
+        "iops_read": [],
+        "iops_write": [],
+        "activity_pct": [],
+    }
+    counter_name_by_id: dict[int, str] = {}
+    try:
+        for counter in list(getattr(perf_manager, "perfCounter", []) or []):
+            group_info = getattr(counter, "groupInfo", None)
+            name_info = getattr(counter, "nameInfo", None)
+            group = str(getattr(group_info, "key", "") or "").lower()
+            name = str(getattr(name_info, "key", "") or "").lower()
+            if group != "datastore":
+                continue
+            cid = int(getattr(counter, "key", 0) or 0)
+            if cid <= 0:
+                continue
+            counter_name_by_id[cid] = name
+
+            if "vmobservedlatency" in name:
+                catalog["vm_observed_latency"].append(cid)
+            if "sizenormalizeddatastorelatency" in name or ("normal" in name and "latency" in name):
+                catalog["normalized_latency"].append(cid)
+            if "numberreadaveraged" in name or "readiops" in name:
+                catalog["iops_read"].append(cid)
+            if "numberwriteaveraged" in name or "writeiops" in name:
+                catalog["iops_write"].append(cid)
+            if "sioc" in name and ("active" in name or "activity" in name):
+                catalog["activity_pct"].append(cid)
+    except Exception:
+        logger.debug("Falha ao resolver catálogo de performance de datastore", exc_info=True)
+
+    for key in list(catalog.keys()):
+        catalog[key] = sorted(set(catalog[key]))
+    return catalog, counter_name_by_id
+
+
+def _sorted_latency_counter_ids(counter_name_by_id: dict[int, str]) -> list[int]:
+    def _rank(name: str) -> int:
+        text = str(name or "").lower()
+        if "vmobserved" in text or ("vm" in text and "latency" in text and "read" not in text and "write" not in text):
+            return 0
+        if text.startswith("total") or "overall" in text:
+            return 1
+        if "read" in text or "write" in text:
+            return 2
+        return 3
+
+    return sorted(
+        set(counter_name_by_id.keys()),
+        key=lambda cid: (_rank(counter_name_by_id.get(cid, "")), counter_name_by_id.get(cid, "")),
+    )
+
+
 def _build_metric_ids(counter_ids: list[int]) -> list[Any]:
     metric_ids: list[Any] = []
     seen: set[tuple[int, str]] = set()
@@ -511,6 +684,64 @@ def _build_metric_ids(counter_ids: list[int]) -> list[Any]:
             seen.add(key)
             metric_ids.append(vim.PerformanceManager.MetricId(counterId=int(counter_id), instance=instance))
     return metric_ids
+
+
+def _build_metric_ids_from_available(
+    available_metrics: list[Any],
+    allowed_counter_ids: set[int],
+    prefer_aggregate: bool = True,
+    max_instances_per_counter: int = 8,
+) -> list[Any]:
+    by_counter: dict[int, list[str]] = {}
+    for metric in list(available_metrics or []):
+        cid = int(getattr(metric, "counterId", 0) or 0)
+        if cid <= 0 or cid not in allowed_counter_ids:
+            continue
+        instance = str(getattr(metric, "instance", "") or "")
+        bucket = by_counter.setdefault(cid, [])
+        if instance not in bucket:
+            bucket.append(instance)
+
+    metric_ids: list[Any] = []
+    for cid in sorted(by_counter.keys()):
+        instances = list(by_counter.get(cid, []))
+        if prefer_aggregate and "" in instances:
+            metric_ids.append(vim.PerformanceManager.MetricId(counterId=int(cid), instance=""))
+            instances = [x for x in instances if x != ""]
+        for instance in instances[: max(0, int(max_instances_per_counter))]:
+            metric_ids.append(vim.PerformanceManager.MetricId(counterId=int(cid), instance=instance))
+    return metric_ids
+
+
+def _extract_counter_values_by_ds(
+    results: list[Any],
+    allowed_counter_ids: set[int],
+) -> dict[str, dict[int, list[float]]]:
+    values_by_ds: dict[str, dict[int, list[float]]] = {}
+    for entity_metric in list(results or []):
+        entity = getattr(entity_metric, "entity", None)
+        ds_id = str(getattr(entity, "_moId", "") or "")
+        if not ds_id:
+            continue
+        per_counter = values_by_ds.setdefault(ds_id, {})
+        for series in list(getattr(entity_metric, "value", []) or []):
+            metric_id = getattr(series, "id", None)
+            counter_id = int(getattr(metric_id, "counterId", 0) or 0)
+            if counter_id <= 0 or counter_id not in allowed_counter_ids:
+                continue
+            samples = list(getattr(series, "value", []) or [])
+            if not samples:
+                continue
+            raw = samples[-1]
+            try:
+                sample_value = float(raw)
+            except Exception:
+                continue
+            if sample_value < 0:
+                continue
+            bucket = per_counter.setdefault(counter_id, [])
+            bucket.append(sample_value)
+    return values_by_ds
 
 
 def _build_query_spec(
@@ -562,14 +793,18 @@ def _extract_latency_values_by_ds(
     results: list[Any],
     read_counter_ids: set[int],
     write_counter_ids: set[int],
+    counter_name_by_id: dict[int, str] | None = None,
 ) -> dict[str, list[float]]:
     values_by_ds: dict[str, list[float]] = {}
+    name_by_id = counter_name_by_id or {}
     for entity_metric in list(results or []):
         entity = getattr(entity_metric, "entity", None)
         ds_id = str(getattr(entity, "_moId", "") or "")
         if not ds_id:
             continue
 
+        vm_observed_values: list[float] = []
+        total_values: list[float] = []
         read_values: list[float] = []
         write_values: list[float] = []
         other_values: list[float] = []
@@ -587,15 +822,27 @@ def _extract_latency_values_by_ds(
 
             metric_id = getattr(series, "id", None)
             counter_id = int(getattr(metric_id, "counterId", 0) or 0)
-            if counter_id in read_counter_ids:
+            counter_name = str(name_by_id.get(counter_id, "") or "").lower()
+            is_vm_observed = "vmobserved" in counter_name or (
+                "vm" in counter_name and "latency" in counter_name and "read" not in counter_name and "write" not in counter_name
+            )
+            is_total = counter_name.startswith("total") or "overall" in counter_name
+
+            if is_vm_observed:
+                vm_observed_values.append(sample_value)
+            elif is_total:
+                total_values.append(sample_value)
+            elif counter_id in read_counter_ids or "read" in counter_name:
                 read_values.append(sample_value)
-            elif counter_id in write_counter_ids:
+            elif counter_id in write_counter_ids or "write" in counter_name:
                 write_values.append(sample_value)
             else:
                 other_values.append(sample_value)
 
         merged = read_values + write_values
-        values_by_ds[ds_id] = merged if merged else other_values
+        selected = vm_observed_values if vm_observed_values else (total_values if total_values else (merged if merged else other_values))
+        if selected:
+            values_by_ds[ds_id] = selected
     return values_by_ds
 
 
@@ -617,9 +864,9 @@ def _collect_datastore_latency_ms(content: Any, datastores: list[dict[str, Any]]
         return latency_by_ds
 
     read_counter_ids, write_counter_ids, name_by_id = _resolve_datastore_latency_counter_ids(content)
-    target_counter_ids = list(read_counter_ids) + list(write_counter_ids)
+    target_counter_ids = _sorted_latency_counter_ids(name_by_id)
     if not target_counter_ids:
-        target_counter_ids = sorted(name_by_id.keys())
+        target_counter_ids = list(read_counter_ids) + list(write_counter_ids)
     metric_ids = _build_metric_ids(target_counter_ids)
     if not metric_ids:
         return latency_by_ds
@@ -646,8 +893,10 @@ def _collect_datastore_latency_ms(content: Any, datastores: list[dict[str, Any]]
     if realtime_interval is not None and realtime_interval > 0:
         query_strategies.append((realtime_interval, None, None))
     query_strategies.append((None, None, None))
+    query_strategies.append((None, now - timedelta(days=7), now))
     for interval_id in historical_ids:
-        lookback_sec = max(1800, int(interval_id) * 8)
+        # Janela mais ampla para capturar último sample real mesmo em ambientes com coleta esparsa.
+        lookback_sec = max(24 * 3600, int(interval_id) * 288)
         start_time = now - timedelta(seconds=lookback_sec)
         query_strategies.append((interval_id, start_time, now))
 
@@ -670,7 +919,7 @@ def _collect_datastore_latency_ms(content: Any, datastores: list[dict[str, Any]]
             continue
         try:
             results = perf_manager.QueryPerf(querySpec=specs) or []
-            values_by_ds = _extract_latency_values_by_ds(results, read_id_set, write_id_set)
+            values_by_ds = _extract_latency_values_by_ds(results, read_id_set, write_id_set, name_by_id)
             if values_by_ds:
                 break
         except Exception:
@@ -689,18 +938,26 @@ def _collect_datastore_latency_ms(content: Any, datastores: list[dict[str, Any]]
                         available_kwargs["intervalId"] = int(interval_id)
                     available_metrics = perf_manager.QueryAvailablePerfMetric(**available_kwargs) or []
                     available_counter_ids = {int(getattr(item, "counterId", 0) or 0) for item in available_metrics}
-                    allowed_ids = [cid for cid in target_counter_ids if cid in available_counter_ids]
+                    allowed_ids = {cid for cid in target_counter_ids if cid in available_counter_ids}
                     if not allowed_ids:
+                        continue
+                    metric_ids_exact = _build_metric_ids_from_available(
+                        available_metrics=available_metrics,
+                        allowed_counter_ids=allowed_ids,
+                        prefer_aggregate=True,
+                        max_instances_per_counter=10,
+                    )
+                    if not metric_ids_exact:
                         continue
                     query_spec = _build_query_spec(
                         ds_obj,
-                        _build_metric_ids(allowed_ids),
+                        metric_ids_exact,
                         interval_id=interval_id,
                         start_time=start_time,
                         end_time=end_time,
                     )
                     partial_results = perf_manager.QueryPerf(querySpec=[query_spec]) or []
-                    partial_values = _extract_latency_values_by_ds(partial_results, read_id_set, write_id_set)
+                    partial_values = _extract_latency_values_by_ds(partial_results, read_id_set, write_id_set, name_by_id)
                     if ds_id in partial_values and partial_values[ds_id]:
                         values_by_ds[ds_id] = partial_values[ds_id]
                         break
@@ -713,6 +970,170 @@ def _collect_datastore_latency_ms(content: Any, datastores: list[dict[str, Any]]
         latency_by_ds[ds_id] = round(sum(values) / len(values), 2)
 
     return latency_by_ds
+
+
+def _collect_datastore_perf_snapshot(content: Any, datastores: list[dict[str, Any]]) -> dict[str, dict[str, float | None]]:
+    if not datastores:
+        return {}
+
+    # Fonte principal com dados reais usados pelo SDRS (quando disponível no host).
+    srm_snapshot = _collect_datastore_srm_snapshot(content, datastores)
+
+    perf_manager = getattr(content, "perfManager", None)
+    if perf_manager is None:
+        return srm_snapshot
+
+    catalog, _ = _resolve_datastore_perf_counter_catalog(content)
+    all_counter_ids = sorted(
+        set(catalog.get("normalized_latency", []))
+        | set(catalog.get("vm_observed_latency", []))
+        | set(catalog.get("iops_read", []))
+        | set(catalog.get("iops_write", []))
+        | set(catalog.get("activity_pct", []))
+    )
+    if not all_counter_ids:
+        return {}
+
+    metric_ids = _build_metric_ids(all_counter_ids)
+    if not metric_ids:
+        return {}
+
+    datastore_objs: dict[str, Any] = {}
+    sample_ds_obj: Any | None = None
+    for ds in datastores:
+        ds_obj = ds.get("_obj")
+        ds_id = str(ds.get("id") or "")
+        if ds_obj is None or not ds_id:
+            continue
+        datastore_objs[ds_id] = ds_obj
+        if sample_ds_obj is None:
+            sample_ds_obj = ds_obj
+    if not datastore_objs:
+        return {}
+
+    realtime_interval = _resolve_interval_id(perf_manager, sample_ds_obj) if sample_ds_obj is not None else None
+    historical_ids = _historical_interval_ids(perf_manager)
+    now = datetime.now(timezone.utc)
+    query_strategies: list[tuple[int | None, datetime | None, datetime | None]] = []
+    if realtime_interval is not None and realtime_interval > 0:
+        query_strategies.append((realtime_interval, None, None))
+    query_strategies.append((None, None, None))
+    query_strategies.append((None, now - timedelta(days=7), now))
+    for interval_id in historical_ids:
+        lookback_sec = max(24 * 3600, int(interval_id) * 288)
+        start_time = now - timedelta(seconds=lookback_sec)
+        query_strategies.append((interval_id, start_time, now))
+
+    allowed_set = set(all_counter_ids)
+    values_by_ds: dict[str, dict[int, list[float]]] = {}
+    for interval_id, start_time, end_time in query_strategies:
+        specs: list[Any] = []
+        for ds_obj in datastore_objs.values():
+            specs.append(
+                _build_query_spec(
+                    ds_obj,
+                    metric_ids,
+                    interval_id=interval_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            )
+        if not specs:
+            continue
+        try:
+            results = perf_manager.QueryPerf(querySpec=specs) or []
+            values_by_ds = _extract_counter_values_by_ds(results, allowed_set)
+            if values_by_ds:
+                break
+        except Exception:
+            logger.debug("QueryPerf de snapshot de métricas falhou (interval=%s)", interval_id, exc_info=True)
+
+    if not values_by_ds:
+        for ds_id, ds_obj in datastore_objs.items():
+            try:
+                for interval_id, start_time, end_time in query_strategies:
+                    available_kwargs: dict[str, Any] = {"entity": ds_obj}
+                    if interval_id is not None and interval_id > 0:
+                        available_kwargs["intervalId"] = int(interval_id)
+                    available_metrics = perf_manager.QueryAvailablePerfMetric(**available_kwargs) or []
+                    available_counter_ids = {int(getattr(item, "counterId", 0) or 0) for item in available_metrics}
+                    allowed_ids = {cid for cid in all_counter_ids if cid in available_counter_ids}
+                    if not allowed_ids:
+                        continue
+                    metric_ids_exact = _build_metric_ids_from_available(
+                        available_metrics=available_metrics,
+                        allowed_counter_ids=allowed_ids,
+                        prefer_aggregate=True,
+                        max_instances_per_counter=10,
+                    )
+                    if not metric_ids_exact:
+                        continue
+                    query_spec = _build_query_spec(
+                        ds_obj,
+                        metric_ids_exact,
+                        interval_id=interval_id,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                    partial_results = perf_manager.QueryPerf(querySpec=[query_spec]) or []
+                    partial_values = _extract_counter_values_by_ds(partial_results, allowed_set)
+                    if ds_id in partial_values and partial_values[ds_id]:
+                        values_by_ds[ds_id] = partial_values[ds_id]
+                        break
+            except Exception:
+                logger.debug("Fallback de snapshot de métricas falhou para datastore %s", ds_id, exc_info=True)
+
+    def _avg(values: list[float]) -> float | None:
+        if not values:
+            return None
+        return round(sum(values) / len(values), 2)
+
+    snapshot: dict[str, dict[str, float | None]] = dict(srm_snapshot)
+    for ds_id, counters in values_by_ds.items():
+        if not counters:
+            continue
+
+        normalized_values: list[float] = []
+        vm_observed_values: list[float] = []
+        iops_read_total = 0.0
+        iops_write_total = 0.0
+        activity_values: list[float] = []
+
+        for cid in catalog.get("normalized_latency", []):
+            normalized_values.extend(list(counters.get(cid, []) or []))
+        for cid in catalog.get("vm_observed_latency", []):
+            vm_observed_values.extend(list(counters.get(cid, []) or []))
+        for cid in catalog.get("iops_read", []):
+            avg_value = _avg(list(counters.get(cid, []) or []))
+            if avg_value is not None:
+                iops_read_total += avg_value
+        for cid in catalog.get("iops_write", []):
+            avg_value = _avg(list(counters.get(cid, []) or []))
+            if avg_value is not None:
+                iops_write_total += avg_value
+        for cid in catalog.get("activity_pct", []):
+            activity_values.extend(list(counters.get(cid, []) or []))
+
+        normalized_us = _avg(normalized_values)
+        vm_observed_us = _avg(vm_observed_values)
+        aggregate_iops = round(iops_read_total + iops_write_total, 2) if (iops_read_total > 0 or iops_write_total > 0) else None
+        activity_pct = _avg(activity_values)
+        latency_ms_from_vm = round(vm_observed_us / 1000.0, 2) if vm_observed_us is not None else None
+
+        current = dict(snapshot.get(ds_id) or {})
+        if normalized_us is not None:
+            current["io_normalized_latency_us"] = normalized_us
+        if vm_observed_us is not None:
+            current["io_vm_observed_latency_us"] = vm_observed_us
+        if aggregate_iops is not None:
+            current["io_aggregate_iops"] = aggregate_iops
+        if activity_pct is not None:
+            current["io_activity_pct"] = activity_pct
+        if latency_ms_from_vm is not None:
+            current["latency_ms_from_vm"] = latency_ms_from_vm
+        snapshot[ds_id] = current
+
+    return snapshot
 
 
 def _fetch_clusters_from_content(content: Any) -> dict[str, dict[str, Any]]:
@@ -733,30 +1154,129 @@ def _fetch_clusters_from_content(content: Any) -> dict[str, dict[str, Any]]:
         all_datastores.extend(list(cluster.get("datastores", []) or []))
 
     latency_timeout = _env_int("LATENCY_COLLECT_TIMEOUT_SEC", 20, 5, 120)
+    _apply_latency_to_clusters(content, clusters, all_datastores, latency_timeout, "batch_inventory")
+    perf_timeout = _env_int("PERF_SNAPSHOT_TIMEOUT_SEC", 25, 5, 180)
+    _apply_perf_snapshot_to_clusters(content, clusters, all_datastores, perf_timeout, "batch_inventory")
+
+    return dict(sorted(clusters.items(), key=lambda item: str(item[1].get("name") or "").lower()))
+
+
+def _collect_latency_with_timeout(
+    content: Any,
+    datastores: list[dict[str, Any]],
+    timeout_sec: int,
+    context: str,
+) -> dict[str, float | None]:
     latency_by_ds: dict[str, float | None] = {}
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        future = ex.submit(_collect_datastore_latency_ms, content, all_datastores)
-        latency_by_ds = future.result(timeout=latency_timeout)
+        future = ex.submit(_collect_datastore_latency_ms, content, datastores)
+        latency_by_ds = future.result(timeout=max(1, int(timeout_sec)))
     except concurrent.futures.TimeoutError:
         logger.warning(
-            "Coleta de latência ultrapassou %ss — retornando clusters sem latência neste ciclo.",
-            latency_timeout,
+            "Coleta de latência (%s) ultrapassou %ss.",
+            context,
+            timeout_sec,
         )
     except Exception as exc:
-        logger.debug("Coleta de latência falhou: %s", exc)
+        logger.debug("Coleta de latência (%s) falhou: %s", context, exc)
     finally:
         # Não bloquear o fluxo principal aguardando worker de latência.
         ex.shutdown(wait=False, cancel_futures=True)
+    return latency_by_ds
 
-    if latency_by_ds:
-        for cluster in clusters.values():
-            for ds in list(cluster.get("datastores", []) or []):
-                ds_id = str(ds.get("id") or "")
-                if ds_id and ds_id in latency_by_ds:
-                    ds["latency_ms"] = latency_by_ds.get(ds_id)
 
-    return dict(sorted(clusters.items(), key=lambda item: str(item[1].get("name") or "").lower()))
+def _apply_latency_to_clusters(
+    content: Any,
+    clusters: dict[str, dict[str, Any]],
+    datastores: list[dict[str, Any]],
+    timeout_sec: int,
+    context: str,
+) -> None:
+    latency_by_ds = _collect_latency_with_timeout(content, datastores, timeout_sec, context)
+    if not latency_by_ds:
+        return
+    for cluster in clusters.values():
+        for ds in list(cluster.get("datastores", []) or []):
+            ds_id = str(ds.get("id") or "")
+            if ds_id and ds_id in latency_by_ds:
+                ds["latency_ms"] = latency_by_ds.get(ds_id)
+
+
+def _collect_perf_snapshot_with_timeout(
+    content: Any,
+    datastores: list[dict[str, Any]],
+    timeout_sec: int,
+    context: str,
+) -> dict[str, dict[str, float | None]]:
+    snapshot: dict[str, dict[str, float | None]] = {}
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = ex.submit(_collect_datastore_perf_snapshot, content, datastores)
+        snapshot = future.result(timeout=max(1, int(timeout_sec)))
+    except concurrent.futures.TimeoutError:
+        logger.warning("Coleta de snapshot de performance (%s) ultrapassou %ss.", context, timeout_sec)
+    except Exception as exc:
+        logger.debug("Coleta de snapshot de performance (%s) falhou: %s", context, exc)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return snapshot
+
+
+def _apply_perf_snapshot_to_clusters(
+    content: Any,
+    clusters: dict[str, dict[str, Any]],
+    datastores: list[dict[str, Any]],
+    timeout_sec: int,
+    context: str,
+) -> None:
+    snapshot_by_ds = _collect_perf_snapshot_with_timeout(content, datastores, timeout_sec, context)
+    if not snapshot_by_ds:
+        return
+    for cluster in clusters.values():
+        for ds in list(cluster.get("datastores", []) or []):
+            ds_id = str(ds.get("id") or "")
+            if not ds_id:
+                continue
+            snap = snapshot_by_ds.get(ds_id)
+            if not snap:
+                continue
+            ds["io_normalized_latency_us"] = snap.get("io_normalized_latency_us")
+            ds["io_aggregate_iops"] = snap.get("io_aggregate_iops")
+            ds["io_activity_pct"] = snap.get("io_activity_pct")
+            ds["io_vm_observed_latency_us"] = snap.get("io_vm_observed_latency_us")
+            if ds.get("latency_ms") is None and snap.get("latency_ms_from_vm") is not None:
+                ds["latency_ms"] = snap.get("latency_ms_from_vm")
+
+
+def _fetch_single_cluster_from_content(
+    content: Any,
+    cluster_id: str,
+    latency_timeout_sec: int,
+) -> dict[str, Any] | None:
+    with _view(content, [vim.StoragePod]) as pod_view:
+        for pod_obj in pod_view:
+            if str(getattr(pod_obj, "_moId", "") or "") != str(cluster_id or ""):
+                continue
+            cluster = _serialize_cluster_from_pod(pod_obj)
+            datastores = list(cluster.get("datastores", []) or [])
+            if datastores:
+                _apply_latency_to_clusters(
+                    content,
+                    {str(cluster.get("id") or cluster_id): cluster},
+                    datastores,
+                    latency_timeout_sec,
+                    f"single_cluster:{cluster_id}",
+                )
+                _apply_perf_snapshot_to_clusters(
+                    content,
+                    {str(cluster.get("id") or cluster_id): cluster},
+                    datastores,
+                    latency_timeout_sec,
+                    f"single_cluster:{cluster_id}",
+                )
+            return cluster
+    return None
 
 
 def _fetch_vms_from_content(content: Any) -> list[dict[str, Any]]:
@@ -896,14 +1416,19 @@ def _cluster_summary(cluster: dict[str, Any]) -> dict[str, Any]:
     datastores = list(cluster.get("datastores", []) or [])
     total_free = round(sum(_to_float(ds.get("free_gb"), 0.0) for ds in datastores), 2)
     total_capacity = round(sum(_to_float(ds.get("capacity_gb"), 0.0) for ds in datastores), 2)
+    latencies = [_to_float(ds.get("latency_ms")) for ds in datastores if ds.get("latency_ms") is not None]
+    avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else None
     sdrs_enabled = bool(cluster.get("sdrs_enabled", False))
     return {
         "id": cluster.get("id"),
         "name": cluster.get("name"),
         "sdrs_enabled": sdrs_enabled,
-        "sdrs_automation_level": "Manual",
-        "free_space_threshold": None,
-        "io_latency_threshold": None,
+        "sdrs_automation_level": cluster.get("sdrs_automation_level", "Manual"),
+        "free_space_threshold": cluster.get("free_space_threshold"),
+        "space_threshold_mode": cluster.get("space_threshold_mode"),
+        "space_utilization_threshold": cluster.get("space_utilization_threshold"),
+        "io_latency_threshold": cluster.get("io_latency_threshold"),
+        "avg_latency_ms": avg_latency,
         "datastore_count": len(datastores),
         "total_free_gb": total_free,
         "total_capacity_gb": total_capacity,
@@ -917,9 +1442,11 @@ def _cluster_detail(cluster: dict[str, Any]) -> dict[str, Any]:
         "id": cluster.get("id"),
         "name": cluster.get("name"),
         "sdrs_enabled": sdrs_enabled,
-        "sdrs_automation_level": "Manual",
-        "free_space_threshold": None,
-        "io_latency_threshold": None,
+        "sdrs_automation_level": cluster.get("sdrs_automation_level", "Manual"),
+        "free_space_threshold": cluster.get("free_space_threshold"),
+        "space_threshold_mode": cluster.get("space_threshold_mode"),
+        "space_utilization_threshold": cluster.get("space_utilization_threshold"),
+        "io_latency_threshold": cluster.get("io_latency_threshold"),
         "datastore_count": len(datastores),
         "datastores": [
             {
@@ -929,6 +1456,12 @@ def _cluster_detail(cluster: dict[str, Any]) -> dict[str, Any]:
                 "free_gb": ds.get("free_gb"),
                 "used_pct": ds.get("used_pct"),
                 "latency_ms": ds.get("latency_ms"),
+                "io_normalized_latency_us": ds.get("io_normalized_latency_us"),
+                "io_aggregate_iops": ds.get("io_aggregate_iops"),
+                "io_activity_pct": ds.get("io_activity_pct"),
+                "io_vm_observed_latency_us": ds.get("io_vm_observed_latency_us"),
+                "accessible": ds.get("accessible"),
+                "datastore_type": ds.get("datastore_type"),
             }
             for ds in datastores
         ],
@@ -980,6 +1513,182 @@ def _compatibility(target_capacity: float, target_free: float, vm_size: float, p
     return len(reasons) == 0, reasons, projected_free, projected_free_pct, projected_used_pct
 
 
+def _select_best_target_for_vm(
+    source_ds: dict[str, Any],
+    datastores: list[dict[str, Any]],
+    vm_size_bytes: float,
+    policy: dict[str, float | int],
+) -> dict[str, Any] | None:
+    source_capacity = _to_float(source_ds.get("_capacity_bytes"), 0.0)
+    source_free = _to_float(source_ds.get("_free_bytes"), 0.0)
+    source_used = _to_float(source_ds.get("used_pct"), 0.0)
+    source_after_used = _calc_used_pct(source_capacity, source_free + vm_size_bytes)
+
+    best: dict[str, Any] | None = None
+    for target_ds in datastores:
+        if target_ds.get("id") == source_ds.get("id"):
+            continue
+
+        target_capacity = _to_float(target_ds.get("_capacity_bytes"), 0.0)
+        target_free = _to_float(target_ds.get("_free_bytes"), 0.0)
+        target_used = _to_float(target_ds.get("used_pct"), 0.0)
+        compatible, reasons, projected_free, projected_free_pct, projected_used_pct = _compatibility(
+            target_capacity,
+            target_free,
+            vm_size_bytes,
+            policy,
+        )
+        if not bool(target_ds.get("accessible", True)):
+            compatible = False
+            if "target_datastore_inaccessible" not in reasons:
+                reasons.append("target_datastore_inaccessible")
+        if not compatible or projected_used_pct is None:
+            continue
+
+        before_gap = abs(source_used - target_used)
+        after_gap = abs(_to_float(source_after_used, source_used) - _to_float(projected_used_pct, target_used))
+        balance_gain = round(before_gap - after_gap, 2)
+        if balance_gain <= 0:
+            continue
+
+        candidate = {
+            "target_id": target_ds.get("id"),
+            "target_name": target_ds.get("name"),
+            "target_used_pct": target_used,
+            "target_used_after_pct": projected_used_pct,
+            "target_free_after_gb": _to_gb(projected_free),
+            "target_free_after_pct": projected_free_pct,
+            "source_used_after_pct": source_after_used,
+            "balance_gain_pct": balance_gain,
+        }
+        if best is None:
+            best = candidate
+            continue
+        if (
+            _to_float(candidate.get("balance_gain_pct"), 0.0) > _to_float(best.get("balance_gain_pct"), 0.0)
+            or (
+                _to_float(candidate.get("balance_gain_pct"), 0.0) == _to_float(best.get("balance_gain_pct"), 0.0)
+                and _to_float(candidate.get("target_used_after_pct"), 999.0)
+                < _to_float(best.get("target_used_after_pct"), 999.0)
+            )
+        ):
+            best = candidate
+
+    return best
+
+
+def _build_space_only_candidates(
+    cluster: dict[str, Any],
+    vms: list[dict[str, Any]],
+    policy: dict[str, float | int],
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    datastores = list(cluster.get("datastores", []) or [])
+    if len(datastores) < 2:
+        return [], 0
+
+    ds_by_id = {str(ds.get("id") or ""): ds for ds in datastores if ds.get("id")}
+    used_values = [_to_float(ds.get("used_pct"), 0.0) for ds in datastores if ds.get("used_pct") is not None]
+    avg_used = round(sum(used_values) / len(used_values), 2) if used_values else 0.0
+    source_threshold = max(65.0, avg_used)
+
+    vm_by_source: dict[str, list[dict[str, Any]]] = {}
+    for vm in vms:
+        ds_id = str(vm.get("home_datastore_id") or "")
+        if not ds_id or ds_id not in ds_by_id:
+            continue
+        size_gb = _to_float(vm.get("size_gb"), 0.0)
+        if size_gb <= 0:
+            continue
+        vm_by_source.setdefault(ds_id, []).append(vm)
+
+    source_candidates = 0
+    items: list[dict[str, Any]] = []
+    seen_vm: set[str] = set()
+    ordered_sources = sorted(
+        datastores,
+        key=lambda ds: (_to_float(ds.get("used_pct"), 0.0), str(ds.get("name") or "")),
+        reverse=True,
+    )
+    for source_idx, source_ds in enumerate(ordered_sources):
+        source_id = str(source_ds.get("id") or "")
+        if not source_id:
+            continue
+        source_used = _to_float(source_ds.get("used_pct"), 0.0)
+        if source_used < source_threshold and source_idx > 3:
+            continue
+        source_vms = sorted(
+            list(vm_by_source.get(source_id, []) or []),
+            key=lambda vm: _to_float(vm.get("size_gb"), 0.0),
+            reverse=True,
+        )
+        if not source_vms:
+            continue
+        source_candidates += 1
+        for vm in source_vms:
+            vm_id = str(vm.get("vm_id") or "")
+            if not vm_id or vm_id in seen_vm:
+                continue
+            vm_size_gb = _to_float(vm.get("size_gb"), 0.0)
+            vm_size_bytes = vm_size_gb * GB
+            if vm_size_bytes <= 0:
+                continue
+            best_target = _select_best_target_for_vm(source_ds, datastores, vm_size_bytes, policy)
+            if best_target is None:
+                continue
+
+            score = round(
+                min(
+                    100.0,
+                    max(
+                        0.0,
+                        55.0
+                        + (_to_float(best_target.get("balance_gain_pct"), 0.0) * 2.0)
+                        + max(0.0, _to_float(source_ds.get("used_pct"), 0.0) - 80.0),
+                    ),
+                ),
+                1,
+            )
+            items.append(
+                {
+                    "key": f"{vm_id}:{source_id}:{best_target.get('target_id')}",
+                    "vm_id": vm_id,
+                    "vm_name": vm.get("vm_name"),
+                    "size_gb": vm_size_gb,
+                    "source_ds_id": source_id,
+                    "source_ds": source_ds.get("name"),
+                    "target_ds_id": best_target.get("target_id"),
+                    "target_ds": best_target.get("target_name"),
+                    "source_used_pct": source_ds.get("used_pct"),
+                    "target_used_pct": best_target.get("target_used_pct"),
+                    "source_used_after_pct": best_target.get("source_used_after_pct"),
+                    "target_used_after_pct": best_target.get("target_used_after_pct"),
+                    "balance_gain_pct": best_target.get("balance_gain_pct"),
+                    "score": score,
+                    "reason": (
+                        f"Space-only rebalance: reduzir {source_ds.get('name')} "
+                        f"({round(source_used, 2)}%) para alvo mais equilibrado."
+                    ),
+                    "mode": "space_only",
+                }
+            )
+            seen_vm.add(vm_id)
+            if len(items) >= max(1, int(limit)):
+                break
+        if len(items) >= max(1, int(limit)):
+            break
+
+    items.sort(
+        key=lambda item: (
+            _to_float(item.get("score"), 0.0),
+            _to_float(item.get("balance_gain_pct"), 0.0),
+            _to_float(item.get("size_gb"), 0.0),
+        ),
+        reverse=True,
+    )
+    return items[: max(1, int(limit))], source_candidates
+
+
 def _normalize_task_state(raw: Any) -> str:
     state = str(raw or "unknown")
     if "." in state:
@@ -1001,10 +1710,14 @@ def _find_task(content: Any, task_id: str) -> Any | None:
             logger.debug("Falha ao buscar task em taskManager.recentTask", exc_info=True)
 
     # Fallback para varredura de tasks visíveis no inventário.
-    with _view(content, [vim.Task]) as tasks:
-        for task in tasks:
-            if getattr(task, "_moId", None) == task_id:
-                return task
+    # Alguns ambientes retornam InvalidArgument para type=vim.Task.
+    try:
+        with _view(content, [vim.Task]) as tasks:
+            for task in tasks:
+                if getattr(task, "_moId", None) == task_id:
+                    return task
+    except Exception:
+        logger.debug("Varredura via ContainerView(vim.Task) indisponível", exc_info=True)
     return None
 
 
@@ -1034,6 +1747,27 @@ def _get_cluster_detail_sync(client: VCenterClient, cluster_id: str) -> dict[str
     cluster = clusters.get(cluster_id)
     if cluster is None:
         return {}
+
+    datastores = list(cluster.get("datastores", []) or [])
+    has_any_latency = any(ds.get("latency_ms") is not None for ds in datastores)
+    if datastores and not has_any_latency:
+        detail_timeout = _env_int("LATENCY_COLLECT_DETAIL_TIMEOUT_SEC", 45, 5, 180)
+        try:
+            with _service_instance(client) as si:
+                content = si.RetrieveContent()
+                fresh_cluster = _fetch_single_cluster_from_content(content, cluster_id, detail_timeout)
+                if fresh_cluster is not None:
+                    fresh_datastores = list(fresh_cluster.get("datastores", []) or [])
+                    if any(ds.get("latency_ms") is not None for ds in fresh_datastores):
+                        cluster = fresh_cluster
+                    else:
+                        logger.info(
+                            "Latência real indisponível para cluster=%s mesmo após coleta dedicada (%ss).",
+                            cluster_id,
+                            detail_timeout,
+                        )
+        except Exception:
+            logger.debug("Falha ao coletar latência dedicada do cluster %s", cluster_id, exc_info=True)
     return _cluster_detail(cluster)
 
 
@@ -1044,23 +1778,43 @@ def _get_pending_recommendations_sync(client: VCenterClient, cluster_id: str) ->
 
 
 def _build_move_candidates_sync(client: VCenterClient, cluster_id: str, limit: int = 20) -> dict[str, Any]:
-    clusters = _cluster_inventory_sync(client)
+    clusters, vms = _inventory_sync(client)
     cluster = clusters.get(cluster_id)
-    _ = limit
+    policy = _move_policy()
+    safe_limit = max(1, min(int(limit), 50))
     cluster_name = cluster.get("name") if cluster else None
+    if cluster is None:
+        return {
+            "cluster_id": cluster_id,
+            "cluster_name": cluster_name,
+            "policy": policy,
+            "source_candidates": 0,
+            "items": [],
+            "reason": "cluster_not_found",
+        }
+
+    items, source_candidates = _build_space_only_candidates(
+        cluster=cluster,
+        vms=vms,
+        policy=policy,
+        limit=safe_limit,
+    )
     return {
         "cluster_id": cluster_id,
         "cluster_name": cluster_name,
-        "policy": _move_policy(),
-        "items": [],
-        "reason": "ok" if cluster else "cluster_not_found",
+        "policy": policy,
+        "source_candidates": source_candidates,
+        "items": items,
+        "reason": "ok",
     }
 
 
 def _build_simulated_plan_sync(client: VCenterClient, cluster_id: str, max_moves: int = 3) -> dict[str, Any]:
-    clusters = _cluster_inventory_sync(client)
+    clusters, vms = _inventory_sync(client)
     cluster = clusters.get(cluster_id)
     datastores = list(cluster.get("datastores", []) or []) if cluster else []
+    policy = _move_policy()
+    safe_max = max(1, min(int(max_moves), 10))
     used_values = [
         _to_float(ds.get("used_pct"), 0.0)
         for ds in datastores
@@ -1071,17 +1825,171 @@ def _build_simulated_plan_sync(client: VCenterClient, cluster_id: str, max_moves
     min_used = round(min(used_values), 2) if used_values else 0.0
     imbalance = round(max_used - min_used, 2) if used_values else 0.0
 
+    if cluster is None:
+        return {
+            "cluster_id": cluster_id,
+            "cluster_name": None,
+            "max_moves": safe_max,
+            "policy": policy,
+            "before": {"avg_used_pct": avg_used, "space_imbalance_pct": imbalance},
+            "after": {"avg_used_pct": avg_used, "space_imbalance_pct": imbalance},
+            "delta": {"avg_used_pct_delta": 0.0, "space_imbalance_pct_delta": 0.0},
+            "source_candidates": 0,
+            "items": [],
+            "reason": "cluster_not_found",
+        }
+
+    candidates, source_candidates = _build_space_only_candidates(
+        cluster=cluster,
+        vms=vms,
+        policy=policy,
+        limit=max(safe_max * 5, safe_max),
+    )
+
+    ds_state: dict[str, dict[str, float]] = {}
+    for ds in datastores:
+        ds_id = str(ds.get("id") or "")
+        if not ds_id:
+            continue
+        ds_state[ds_id] = {
+            "capacity": _to_float(ds.get("_capacity_bytes"), 0.0),
+            "free": _to_float(ds.get("_free_bytes"), 0.0),
+        }
+
+    selected_vm_ids: set[str] = set()
+    items: list[dict[str, Any]] = []
+    for _ in range(safe_max):
+        best_choice: dict[str, Any] | None = None
+        current_used_values = [
+            _calc_used_pct(state["capacity"], state["free"])
+            for state in ds_state.values()
+            if state.get("capacity", 0.0) > 0
+        ]
+        current_used_values = [value for value in current_used_values if value is not None]
+        current_imbalance = (
+            round(max(current_used_values) - min(current_used_values), 2)
+            if current_used_values
+            else 0.0
+        )
+        for cand in candidates:
+            vm_id = str(cand.get("vm_id") or "")
+            if not vm_id or vm_id in selected_vm_ids:
+                continue
+            src_id = str(cand.get("source_ds_id") or "")
+            tgt_id = str(cand.get("target_ds_id") or "")
+            vm_size_bytes = _to_float(cand.get("size_gb"), 0.0) * GB
+            src_state = ds_state.get(src_id)
+            tgt_state = ds_state.get(tgt_id)
+            if src_state is None or tgt_state is None or vm_size_bytes <= 0:
+                continue
+
+            source_used = _calc_used_pct(src_state["capacity"], src_state["free"])
+            target_used = _calc_used_pct(tgt_state["capacity"], tgt_state["free"])
+            if source_used is None or target_used is None:
+                continue
+
+            compatible, _, projected_free, _, projected_target_used = _compatibility(
+                tgt_state["capacity"],
+                tgt_state["free"],
+                vm_size_bytes,
+                policy,
+            )
+            if not compatible or projected_target_used is None:
+                continue
+
+            projected_source_used = _calc_used_pct(src_state["capacity"], src_state["free"] + vm_size_bytes)
+            if projected_source_used is None:
+                continue
+
+            projected_used_values: list[float] = []
+            for ds_key, state in ds_state.items():
+                if state.get("capacity", 0.0) <= 0:
+                    continue
+                if ds_key == src_id:
+                    projected_used_values.append(projected_source_used)
+                elif ds_key == tgt_id:
+                    projected_used_values.append(projected_target_used)
+                else:
+                    used = _calc_used_pct(state["capacity"], state["free"])
+                    if used is not None:
+                        projected_used_values.append(used)
+
+            if not projected_used_values:
+                continue
+            projected_imbalance = round(max(projected_used_values) - min(projected_used_values), 2)
+            cluster_gain = round(current_imbalance - projected_imbalance, 2)
+            if cluster_gain <= 0:
+                continue
+
+            choice = {
+                "candidate": cand,
+                "vm_id": vm_id,
+                "src_id": src_id,
+                "tgt_id": tgt_id,
+                "vm_size_bytes": vm_size_bytes,
+                "source_used_after_pct": projected_source_used,
+                "target_used_after_pct": projected_target_used,
+                "target_projected_free": projected_free,
+                "gain": cluster_gain,
+            }
+            if best_choice is None:
+                best_choice = choice
+                continue
+            if (
+                _to_float(choice.get("gain"), 0.0) > _to_float(best_choice.get("gain"), 0.0)
+                or (
+                    _to_float(choice.get("gain"), 0.0) == _to_float(best_choice.get("gain"), 0.0)
+                    and _to_float(choice.get("target_used_after_pct"), 999.0)
+                    < _to_float(best_choice.get("target_used_after_pct"), 999.0)
+                )
+            ):
+                best_choice = choice
+
+        if best_choice is None:
+            break
+
+        src_state = ds_state[best_choice["src_id"]]
+        tgt_state = ds_state[best_choice["tgt_id"]]
+        src_state["free"] = src_state["free"] + best_choice["vm_size_bytes"]
+        tgt_state["free"] = max(0.0, tgt_state["free"] - best_choice["vm_size_bytes"])
+
+        updated = dict(best_choice["candidate"])
+        updated["source_used_after_pct"] = best_choice["source_used_after_pct"]
+        updated["target_used_after_pct"] = best_choice["target_used_after_pct"]
+        updated["balance_gain_pct"] = best_choice["gain"]
+        updated["score"] = round(
+            min(100.0, max(0.0, 55.0 + (_to_float(best_choice["gain"], 0.0) * 2.0))),
+            1,
+        )
+        items.append(updated)
+        selected_vm_ids.add(best_choice["vm_id"])
+
+    after_used_values: list[float] = []
+    for state in ds_state.values():
+        after_used = _calc_used_pct(state["capacity"], state["free"])
+        if after_used is not None:
+            after_used_values.append(after_used)
+    after_avg = round(sum(after_used_values) / len(after_used_values), 2) if after_used_values else avg_used
+    after_imbalance = (
+        round(max(after_used_values) - min(after_used_values), 2)
+        if after_used_values
+        else imbalance
+    )
+
     return {
         "cluster_id": cluster_id,
-        "cluster_name": cluster.get("name") if cluster else None,
-        "max_moves": max_moves,
-        "policy": _move_policy(),
+        "cluster_name": cluster.get("name"),
+        "max_moves": safe_max,
+        "policy": policy,
         "before": {"avg_used_pct": avg_used, "space_imbalance_pct": imbalance},
-        "after": {"avg_used_pct": avg_used, "space_imbalance_pct": imbalance},
-        "delta": {"avg_used_pct_delta": 0.0, "space_imbalance_pct_delta": 0.0},
-        "source_candidates": 0,
-        "items": [],
-        "reason": "ok" if cluster else "cluster_not_found",
+        "after": {"avg_used_pct": after_avg, "space_imbalance_pct": after_imbalance},
+        "delta": {
+            "avg_used_pct_delta": round(after_avg - avg_used, 2),
+            "space_imbalance_pct_delta": round(after_imbalance - imbalance, 2),
+        },
+        "source_candidates": source_candidates,
+        "items": items,
+        "reason": "ok",
     }
 
 
@@ -1097,8 +2005,9 @@ def _diagnose_latency_collection_sync(client: VCenterClient, cluster_id: str | N
         srm_available = bool(srm is not None and hasattr(srm, "QueryDatastorePerformanceSummary"))
         read_ids: list[int] = []
         write_ids: list[int] = []
+        counter_name_by_id: dict[int, str] = {}
         if perf_manager is not None:
-            read_ids, write_ids, _ = _resolve_datastore_latency_counter_ids(content)
+            read_ids, write_ids, counter_name_by_id = _resolve_datastore_latency_counter_ids(content)
 
     cluster_reports: list[dict[str, Any]] = []
     total_datastores = 0
@@ -1149,7 +2058,9 @@ def _diagnose_latency_collection_sync(client: VCenterClient, cluster_id: str | N
         "latency_counter_ids": {
             "read": read_ids,
             "write": write_ids,
+            "all": _sorted_latency_counter_ids(counter_name_by_id),
         },
+        "latency_counter_names": {str(cid): name for cid, name in counter_name_by_id.items()},
         "clusters": cluster_reports,
     }
 
